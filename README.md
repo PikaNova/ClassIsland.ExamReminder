@@ -3,7 +3,8 @@
 ClassIsland 2.x 插件，用于连接学校部署的考试看板、同步当前设备绑定班级的考试，并通过 ClassIsland 提醒 V2 API 显示开考提醒。
 
 项目主页：<https://github.com/PikaNova/ClassIsland.ExamReminder>
-考试看板项目地址：<ttps://github.com/PikaNova/Novora>
+
+考试看板项目地址：<https://github.com/PikaNova/Novora>
 
 当前插件版本保留 `ClassIsland.PluginSdk 1.7.106.2-dev-v2` 和 `net8.0-windows` 目标，支持考试看板 ClassIsland API v2，并兼容未返回版本字段的 API v1 服务端。
 
