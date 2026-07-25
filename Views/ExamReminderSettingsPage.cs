@@ -28,9 +28,11 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
     private readonly TextBlock _statusText;
     private readonly TextBlock _classText;
     private readonly TextBlock _syncText;
+    private readonly TextBlock _viewerText;
     private readonly TextBlock _nextExamText;
     private readonly ComboBox _leadTimeBox;
     private readonly CheckBox _autoOpenCheckBox;
+    private readonly CheckBox _examGuardCheckBox;
     private readonly CheckBox _fifteenMinuteCheckBox;
     private readonly CheckBox _fiveMinuteCheckBox;
     private readonly CheckBox _startCheckBox;
@@ -56,6 +58,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
         _statusText = StatusText();
         _classText = ValueText();
         _syncText = ValueText();
+        _viewerText = ValueText();
         _nextExamText = ValueText();
         _leadTimeBox = new ComboBox
         {
@@ -63,6 +66,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             Width = 120,
         };
         _autoOpenCheckBox = new CheckBox { Content = "自动打开考试看板" };
+        _examGuardCheckBox = new CheckBox { Content = "考试期间守护看板" };
         _fifteenMinuteCheckBox = new CheckBox { Content = "开考前 15 分钟提醒" };
         _fiveMinuteCheckBox = new CheckBox { Content = "开考前 5 分钟提醒" };
         _startCheckBox = new CheckBox { Content = "开考时提醒" };
@@ -94,6 +98,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             }
         };
         _autoOpenCheckBox.Click += (_, _) => SaveSwitches();
+        _examGuardCheckBox.Click += (_, _) => SaveSwitches();
         _fifteenMinuteCheckBox.Click += (_, _) => SaveSwitches();
         _fiveMinuteCheckBox.Click += (_, _) => SaveSwitches();
         _startCheckBox.Click += (_, _) => SaveSwitches();
@@ -114,15 +119,16 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
         var deviceContent = new Grid
         {
             ColumnDefinitions = new ColumnDefinitions("120,*"),
-            RowDefinitions = new RowDefinitions("Auto,Auto,Auto,Auto"),
+            RowDefinitions = new RowDefinitions("Auto,Auto,Auto,Auto,Auto"),
             ColumnSpacing = 16,
             RowSpacing = 12,
         };
         AddKeyValueRow(deviceContent, 0, "绑定班级", _classText);
         AddKeyValueRow(deviceContent, 1, "最近同步", _syncText);
-        AddKeyValueRow(deviceContent, 2, "下一场考试", _nextExamText);
+        AddKeyValueRow(deviceContent, 2, "看板状态", _viewerText);
+        AddKeyValueRow(deviceContent, 3, "下一场考试", _nextExamText);
         var deviceButtons = ButtonRow(syncButton, testButton);
-        Grid.SetRow(deviceButtons, 3);
+        Grid.SetRow(deviceButtons, 4);
         Grid.SetColumn(deviceButtons, 1);
         deviceContent.Children.Add(deviceButtons);
 
@@ -144,6 +150,8 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
                 SettingRow("提前打开考试看板", leadTimeControl),
                 HelpText("提前时间不得少于 20 分钟，确保考试大屏能收到第一条 15 分钟提醒。"),
                 _autoOpenCheckBox,
+                _examGuardCheckBox,
+                HelpText("开考前 1 分钟再次确认看板；考试期间每 15 秒检查，连续两次离线后重新打开。"),
                 _fifteenMinuteCheckBox,
                 _fiveMinuteCheckBox,
                 _startCheckBox,
@@ -231,6 +239,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
         _store.Update(value =>
         {
             value.AutoOpenBoard = _autoOpenCheckBox.IsChecked == true;
+            value.EnableExamGuard = _examGuardCheckBox.IsChecked == true;
             value.EnableFifteenMinuteReminder = _fifteenMinuteCheckBox.IsChecked == true;
             value.EnableFiveMinuteReminder = _fiveMinuteCheckBox.IsChecked == true;
             value.EnableStartReminder = _startCheckBox.IsChecked == true;
@@ -267,11 +276,17 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             ? settings.BoundClassTag
             : "尚未绑定";
         _syncText.Text = settings.LastSyncAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "尚未同步";
+        _viewerText.Text = settings.ViewerOnline
+            ? $"在线 · {settings.LastViewerConfirmedAt:HH:mm:ss}"
+            : settings.LastViewerConfirmedAt is null
+                ? "尚未确认在线"
+                : $"离线 · 最近在线 {settings.LastViewerConfirmedAt:HH:mm:ss}";
         _nextExamText.Text = settings.NextExamStartAt is null
             ? "暂无考试"
             : $"{settings.NextExamName} · {settings.NextExamStartAt.Value.ToLocalTime():MM-dd HH:mm}";
         _leadTimeBox.SelectedItem = settings.BrowserLeadMinutes;
         _autoOpenCheckBox.IsChecked = settings.AutoOpenBoard;
+        _examGuardCheckBox.IsChecked = settings.EnableExamGuard;
         _fifteenMinuteCheckBox.IsChecked = settings.EnableFifteenMinuteReminder;
         _fiveMinuteCheckBox.IsChecked = settings.EnableFiveMinuteReminder;
         _startCheckBox.IsChecked = settings.EnableStartReminder;

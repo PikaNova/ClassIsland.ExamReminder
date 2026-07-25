@@ -13,10 +13,13 @@ public sealed class PluginSettings
     public bool IsPaired { get; set; }
     public int BrowserLeadMinutes { get; set; } = 20;
     public bool AutoOpenBoard { get; set; } = true;
+    public bool EnableExamGuard { get; set; } = true;
     public bool EnableFifteenMinuteReminder { get; set; } = true;
     public bool EnableFiveMinuteReminder { get; set; } = true;
     public bool EnableStartReminder { get; set; } = true;
     public DateTimeOffset? LastSyncAt { get; set; }
+    public bool ViewerOnline { get; set; }
+    public DateTimeOffset? LastViewerConfirmedAt { get; set; }
     public string LastStatus { get; set; } = "请填写考试看板网址并连接";
     public string NextExamName { get; set; } = string.Empty;
     public DateTimeOffset? NextExamStartAt { get; set; }

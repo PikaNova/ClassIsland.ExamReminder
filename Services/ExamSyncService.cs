@@ -6,8 +6,13 @@ namespace ClassIsland.ExamReminder.Services;
 public sealed class ExamSyncService : BackgroundService
 {
     private static readonly TimeSpan SyncInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ProtectionSyncInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan PairingPollInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan FailureRetryInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan PreStartVerificationWindow = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan CriticalSnapshotMaxAge = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan CriticalSyncRequestInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan BrowserReopenCooldown = TimeSpan.FromMinutes(1);
     private readonly PluginSettingsStore _store;
     private readonly ExamBoardClient _client;
     private readonly ExamReminderProvider _provider;
@@ -16,6 +21,9 @@ public sealed class ExamSyncService : BackgroundService
     private long _nextSyncAtUnixMilliseconds = long.MinValue;
     private long _syncRequestVersion;
     private DateTimeOffset _nextBrowserOpenAttemptAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _nextCriticalSyncRequestAtUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastSuccessfulSyncAtUtc = DateTimeOffset.MinValue;
+    private int _consecutiveOfflineGuardChecks;
 
     public ExamSyncService(
         PluginSettingsStore store,
@@ -137,6 +145,7 @@ public sealed class ExamSyncService : BackgroundService
         }
 
         _snapshot = result.Value;
+        _lastSuccessfulSyncAtUtc = DateTimeOffset.UtcNow;
         var offset = result.Value.ServerTime - DateTimeOffset.UtcNow;
         var nextExam = result.Value.Exams
             .Where(exam => exam.EndAt > result.Value.ServerTime)
@@ -147,12 +156,20 @@ public sealed class ExamSyncService : BackgroundService
             value.IsPaired = true;
             value.BoundClassTag = result.Value.Binding?.ClassTag ?? value.BoundClassTag;
             value.LastSyncAt = DateTimeOffset.Now;
+            value.ViewerOnline = result.Value.ViewerOnline;
+            if (result.Value.ViewerOnline)
+            {
+                value.LastViewerConfirmedAt = DateTimeOffset.Now;
+            }
             value.ServerOffsetMilliseconds = (long)offset.TotalMilliseconds;
             value.NextExamName = nextExam?.Name ?? string.Empty;
             value.NextExamStartAt = nextExam?.StartAt;
             value.LastStatus = "已同步考试看板";
         });
-        return SyncInterval;
+        EvaluateBrowserProtection(result.Value, settings, result.Value.ServerTime);
+        return NeedsProtectionSync(result.Value, settings, result.Value.ServerTime)
+            ? ProtectionSyncInterval
+            : SyncInterval;
     }
 
     private void SetStatus(string status)
@@ -175,6 +192,16 @@ public sealed class ExamSyncService : BackgroundService
         foreach (var exam in _snapshot.Exams.OrderBy(value => value.StartAt))
         {
             var remaining = exam.StartAt - now;
+            if (settings.AutoOpenBoard &&
+                remaining > TimeSpan.Zero &&
+                remaining <= PreStartVerificationWindow &&
+                !_store.HasCompletedAction(ActionKey(exam, "prestart-check")) &&
+                DateTimeOffset.UtcNow - _lastSuccessfulSyncAtUtc > CriticalSnapshotMaxAge &&
+                DateTimeOffset.UtcNow >= _nextCriticalSyncRequestAtUtc)
+            {
+                _nextCriticalSyncRequestAtUtc = DateTimeOffset.UtcNow.Add(CriticalSyncRequestInterval);
+                RequestImmediateSync();
+            }
             if (remaining <= TimeSpan.Zero && remaining > TimeSpan.FromMinutes(-2))
             {
                 TriggerReminder(exam, TimeSpan.Zero, "start", settings.EnableStartReminder);
@@ -197,6 +224,7 @@ public sealed class ExamSyncService : BackgroundService
                     if (OpenBoard(settings, out var error))
                     {
                         _store.MarkCompletedAction(key);
+                        _nextBrowserOpenAttemptAt = now.Add(BrowserReopenCooldown);
                     }
                     else
                     {
@@ -235,6 +263,73 @@ public sealed class ExamSyncService : BackgroundService
 
     private bool OpenBoard(PluginSettings settings, out string error) =>
         _uriLauncher.TryOpen(ExamBoardUrls.Board(settings.BaseUrl, settings.PluginInstanceId), out error);
+
+    private void EvaluateBrowserProtection(
+        ExamBoardBootstrapResponse snapshot,
+        PluginSettings settings,
+        DateTimeOffset now)
+    {
+        var upcomingExams = snapshot.Exams
+            .Where(exam => exam.StartAt > now && exam.StartAt - now <= PreStartVerificationWindow)
+            .ToList();
+        var activeExams = snapshot.Exams
+            .Where(exam => exam.StartAt <= now && exam.EndAt > now)
+            .ToList();
+
+        if (snapshot.ViewerOnline)
+        {
+            foreach (var exam in upcomingExams)
+            {
+                _store.MarkCompletedAction(ActionKey(exam, "prestart-check"));
+            }
+            _consecutiveOfflineGuardChecks = 0;
+            return;
+        }
+
+        if (upcomingExams.Count > 0 && settings.AutoOpenBoard)
+        {
+            TryReopenBoard(settings, now, "考前 1 分钟确认发现看板未打开");
+            return;
+        }
+
+        if (activeExams.Count == 0 || !settings.AutoOpenBoard || !settings.EnableExamGuard)
+        {
+            _consecutiveOfflineGuardChecks = 0;
+            return;
+        }
+
+        _consecutiveOfflineGuardChecks++;
+        if (_consecutiveOfflineGuardChecks >= 2)
+        {
+            TryReopenBoard(settings, now, "考试期间检测到看板已离线");
+        }
+    }
+
+    private void TryReopenBoard(PluginSettings settings, DateTimeOffset now, string reason)
+    {
+        if (now < _nextBrowserOpenAttemptAt)
+        {
+            return;
+        }
+
+        _nextBrowserOpenAttemptAt = now.Add(BrowserReopenCooldown);
+        _consecutiveOfflineGuardChecks = 0;
+        if (OpenBoard(settings, out var error))
+        {
+            _store.Update(value => value.LastStatus = $"{reason}，已重新打开");
+            return;
+        }
+
+        _store.Update(value => value.LastStatus = $"{reason}，重新打开失败：{error}");
+    }
+
+    private static bool NeedsProtectionSync(
+        ExamBoardBootstrapResponse snapshot,
+        PluginSettings settings,
+        DateTimeOffset now) =>
+        settings.AutoOpenBoard && snapshot.Exams.Any(exam =>
+            (exam.StartAt > now && exam.StartAt - now <= PreStartVerificationWindow) ||
+            (settings.EnableExamGuard && exam.StartAt <= now && exam.EndAt > now));
 
     private static string ActionKey(ExamBoardExam exam, string action) =>
         $"{exam.Id}|{exam.StartAt.UtcTicks}|{action}";

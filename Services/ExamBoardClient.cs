@@ -8,7 +8,7 @@ namespace ClassIsland.ExamReminder.Services;
 public sealed class ExamBoardClient : IDisposable
 {
     private const int ApiVersion = 2;
-    private const string ClientVersion = "0.2.5.0";
+    private const string ClientVersion = "0.2.6.0";
     private readonly HttpClient _httpClient = new()
     {
         Timeout = TimeSpan.FromSeconds(10),
