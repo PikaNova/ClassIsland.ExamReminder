@@ -1,0 +1,10 @@
+bin/
+obj/
+cipx/
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.nupkg
+*.snupkg
