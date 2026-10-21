@@ -28,12 +28,16 @@ public sealed class ExamBoardExam
 
 public sealed class ExamBoardBinding
 {
+    public string GradeId { get; set; } = string.Empty;
+    public string ClassId { get; set; } = string.Empty;
     [JsonPropertyName("classTag")]
     public string ClassTag { get; set; } = string.Empty;
 }
 
 public sealed class ExamBoardBootstrapResponse
 {
+    public string Version { get; set; } = string.Empty;
+    public bool Changed { get; set; } = true;
     [JsonPropertyName("ok")]
     public bool Ok { get; set; }
 
@@ -82,6 +86,8 @@ public sealed class PairStatusResponse
 
 public sealed record ClientResult<T>(T? Value, string? Error)
 {
+    public int? StatusCode { get; init; }
+    public TimeSpan? RetryAfter { get; init; }
     public bool IsSuccess => Value is not null && Error is null;
 
     public static ClientResult<T> Success(T value) => new(value, null);

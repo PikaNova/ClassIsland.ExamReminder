@@ -1,0 +1,560 @@
+diff --git a/.gitignore b/.gitignore
+index 5cf0c11..f47363c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -33,3 +33,4 @@ packaging/windows/Novora.ServiceHost/bin/
+ packaging/windows/Novora.ServiceHost/obj/
+ .tmp-windows-host-publish/
+ .tmp-tray-publish/
++.integration-check/
+diff --git a/api/_content/announcementCache.ts b/api/_content/announcementCache.ts
+new file mode 100644
+index 0000000..ea5a83d
+--- /dev/null
++++ b/api/_content/announcementCache.ts
+@@ -0,0 +1,22 @@
++// Share one upstream request among callers of the same warm server instance.
++// Keep the existing 60-second freshness budget; this also works without a CDN.
++export function createAnnouncementCache(ttlMs = 60_000) {
++  let cached: { at: number; items: Record<string, unknown>[] } | null = null;
++  let flight: Promise<Record<string, unknown>[]> | null = null;
++  return async (
++    load: () => Promise<Record<string, unknown>[]>,
++    now = Date.now(),
++  ): Promise<Record<string, unknown>[]> => {
++    if (cached && now - cached.at < ttlMs) return cached.items;
++    if (flight) return flight;
++    flight = load()
++      .then((items) => {
++        cached = { at: Date.now(), items };
++        return items;
++      })
++      .finally(() => {
++        flight = null;
++      });
++    return flight;
++  };
++}
+diff --git a/api/_exams/plugin.ts b/api/_exams/plugin.ts
+index 48afeef..dbee592 100644
+--- a/api/_exams/plugin.ts
++++ b/api/_exams/plugin.ts
+@@ -21,6 +21,8 @@ export const CLASSISLAND_API_CAPABILITIES = [
+   'schedule-sync',
+   'viewer-link',
+   'exam-source',
++  'conditional-sync',
++  'session-history',
+ ] as const;
+ export const PLUGIN_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/;
+ export const PLUGIN_SECRET_RE = /^[a-f0-9]{32,256}$/i;
+@@ -50,6 +52,19 @@ export function classIslandApiMeta() {
+   };
+ }
+ 
++// Include the viewer binding and China calendar day: a matching exam revision alone
++// must never preserve another class's schedule or yesterday's rolling window.
++export function pluginSyncVersion(
++  revision: unknown,
++  gradeId: string,
++  classId: string,
++  viewerId: string,
++  now = Date.now(),
++): string {
++  const day = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
++  return sha256(JSON.stringify([String(revision ?? 0), gradeId, classId, viewerId, day]));
++}
++
+ export function classLabel(payload: ExamPayload, gradeId: string, classId: string): string {
+   const grades = (Array.isArray(payload.grades) ? payload.grades : []).map(asRecord);
+   const classes = (Array.isArray(payload.classes) ? payload.classes : []).map(asRecord);
+@@ -72,8 +87,14 @@ export function actorScopeLabel(actor: AdminActor, payload: ExamPayload): string
+   return names.join('、') || '未分配范围';
+ }
+ 
+-export function resolvePluginExams(payload: ExamPayload, gradeId: string, classId: string) {
++export function resolvePluginExams(
++  payload: ExamPayload,
++  gradeId: string,
++  classId: string,
++  includeCompletedToday = false,
++) {
+   const now = Date.now();
++  const dayStart = Math.floor((now + 8 * 60 * 60 * 1000) / 86_400_000) * 86_400_000 - 8 * 60 * 60 * 1000;
+   const schedule = resolveEffectiveSchedule(
+     {
+       scheduleMode: payload.scheduleMode as ScheduleMode,
+@@ -92,7 +113,13 @@ export function resolvePluginExams(payload: ExamPayload, gradeId: string, classI
+   return schedule.activeItems.flatMap((item) => {
+     const start = parseZonedTime(item.startTime);
+     const end = parseZonedTime(item.endTime);
+-    if (!item.enabled || !Number.isFinite(start) || !Number.isFinite(end) || end <= now - 2 * 60 * 1000) return [];
++    if (
++      !item.enabled ||
++      !Number.isFinite(start) ||
++      !Number.isFinite(end) ||
++      end <= (includeCompletedToday ? dayStart : now - 2 * 60 * 1000)
++    )
++      return [];
+     const source = item as typeof item & {
+       kind?: string;
+       majorName?: string;
+diff --git a/api/_exams/routes/pluginRoutes.ts b/api/_exams/routes/pluginRoutes.ts
+index a6feb25..c4b3cd6 100644
+--- a/api/_exams/routes/pluginRoutes.ts
++++ b/api/_exams/routes/pluginRoutes.ts
+@@ -13,6 +13,7 @@ import {
+   classLabel,
+   equalHash,
+   pluginCredentials,
++  pluginSyncVersion,
+   resolvePluginExams,
+   sha256,
+ } from '../plugin.js';
+@@ -209,24 +210,38 @@ export async function handlePluginPairStatusOrBootstrap(
+     return;
+   }
+   await ensureTableOnce();
+-  const rows =
+-    (await sql`SELECT * FROM classisland_plugin_instances WHERE plugin_instance_id=${credentials.instanceId}`) as unknown as PluginInstanceRow[];
++  const rows = (await sql`SELECT p.*, d.grade_id AS viewer_grade_id, d.class_id AS viewer_class_id,
++      d.revoked AS viewer_revoked, d.is_management AS viewer_is_management,
++      d.last_seen_at AS viewer_last_seen_at, e.updated_at AS exam_updated_at
++      FROM classisland_plugin_instances p
++      LEFT JOIN device_instances d ON d.instance_id=p.viewer_instance_id
++      LEFT JOIN exam_data e ON e.id=1
++      WHERE p.plugin_instance_id=${credentials.instanceId}`) as unknown as Array<
++    PluginInstanceRow & {
++      viewer_grade_id: string | null;
++      viewer_class_id: string | null;
++      viewer_revoked: boolean | null;
++      viewer_is_management: boolean | null;
++      viewer_last_seen_at: number | string | null;
++      exam_updated_at: unknown;
++    }
++  >;
+   const plugin = rows[0];
+   if (!plugin || !equalHash(plugin.client_secret_hash, sha256(credentials.secret))) {
+     res.status(401).json({ ok: false, error: 'Plugin credentials rejected' });
+     return;
+   }
+   const viewerInstanceId = String(plugin.viewer_instance_id ?? '');
+-  const deviceRows = viewerInstanceId
+-    ? ((await sql`SELECT grade_id, class_id, revoked, is_management, last_seen_at FROM device_instances WHERE instance_id=${viewerInstanceId}`) as unknown as Array<{
+-        grade_id: string;
+-        class_id: string;
+-        revoked: boolean;
+-        is_management: boolean;
+-        last_seen_at: number | string;
+-      }>)
+-    : [];
+-  const device = deviceRows[0];
++  const device =
++    plugin.viewer_grade_id !== null
++      ? {
++          grade_id: plugin.viewer_grade_id,
++          class_id: plugin.viewer_class_id,
++          revoked: plugin.viewer_revoked,
++          is_management: plugin.viewer_is_management,
++          last_seen_at: plugin.viewer_last_seen_at,
++        }
++      : null;
+   const viewerBindingValid =
+     !!device && !device.revoked && !device.is_management && !!device.grade_id && !!device.class_id;
+   if (!viewerBindingValid && plugin.paired === true) {
+@@ -259,15 +274,34 @@ export async function handlePluginPairStatusOrBootstrap(
+     });
+     return;
+   }
++  const gradeId = String(device.grade_id);
++  const classId = String(device.class_id);
++  const knownVersion = typeof req.body?.knownVersion === 'string' ? req.body.knownVersion.slice(0, 128) : '';
++  if (knownVersion) {
++    const version = pluginSyncVersion(plugin.exam_updated_at, gradeId, classId, viewerInstanceId);
++    if (knownVersion === version) {
++      res.status(200).json({
++        ok: true,
++        ...classIslandApiMeta(),
++        changed: false,
++        version,
++        serverTime: new Date().toISOString(),
++        viewerOnline: Date.now() - Number(device.last_seen_at ?? 0) <= PLUGIN_VIEWER_ONLINE_MS,
++      });
++      return;
++    }
++  }
+   const examRows =
+     (await sql`SELECT items, title, majors, active_major_id, alerts, weekly_plans, schedule_mode, active_weekly_plan_id, active_weekly_plan_by_class, weekly_conflict_policy, grades, classes, initialization, design_policy, updated_at FROM exam_data WHERE id=1`) as unknown as ExamRow[];
+   const payload = examPayload(examRows[0] ?? {});
+-  const gradeId = String(device.grade_id);
+-  const classId = String(device.class_id);
+-  await sql`UPDATE classisland_plugin_instances SET grade_id=${gradeId}, class_id=${classId}, updated_at=${Date.now()} WHERE plugin_instance_id=${credentials.instanceId}`;
++  if (plugin.grade_id !== gradeId || plugin.class_id !== classId) {
++    await sql`UPDATE classisland_plugin_instances SET grade_id=${gradeId}, class_id=${classId}, updated_at=${Date.now()} WHERE plugin_instance_id=${credentials.instanceId}`;
++  }
+   res.status(200).json({
+     ok: true,
+     ...classIslandApiMeta(),
++    changed: true,
++    version: pluginSyncVersion(examRows[0]?.updated_at, gradeId, classId, viewerInstanceId),
+     schemaVersion: CLASSISLAND_API_VERSION,
+     serverTime: new Date().toISOString(),
+     binding: {
+@@ -277,7 +311,7 @@ export async function handlePluginPairStatusOrBootstrap(
+     },
+     school: payload.initialization ?? {},
+     viewerOnline: viewerBindingValid && Date.now() - Number(device.last_seen_at ?? 0) <= PLUGIN_VIEWER_ONLINE_MS,
+-    exams: resolvePluginExams(payload, gradeId, classId),
++    exams: resolvePluginExams(payload, gradeId, classId, req.body?.includeCompletedToday === true),
+     updatedAt: payload.updatedAt,
+   });
+   return;
+diff --git a/api/announcements.ts b/api/announcements.ts
+index f013a03..201ca51 100644
+--- a/api/announcements.ts
++++ b/api/announcements.ts
+@@ -2,6 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
+ import { telemetryConfig } from './_telemetryConfig.js';
+ import { handleAnnouncementImages } from './_content/announcementImages.js';
+ import { resolveSubRoute } from './_routeMatch.js';
++import { createAnnouncementCache } from './_content/announcementCache.js';
+ 
+ // 公告代理：转发到作者端遥测台的公开公告接口。
+ // 作者端统一发布，各「考试看板」实例通过本代理拉取已发布公告（避免浏览器直连跨域）。
+@@ -11,6 +12,7 @@ import { resolveSubRoute } from './_routeMatch.js';
+ // /api/announcement-images（公告图片同源代理）也由本入口承载：公告正文里存的是它的绝对路径，
+ // 所以这个 URL 必须一直可用，改成 rewrite 别名并合并进本文件只是为了少占一个 Vercel Function。
+ const ANNOUNCE_URL = telemetryConfig.announceUrl;
++const readAnnouncements = createAnnouncementCache();
+ 
+ export default async function handler(req: VercelRequest, res: VercelResponse) {
+   // 图片代理与公告列表共用本入口，判据按可靠性排序：
+@@ -37,21 +39,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
+   try {
+     const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+     const limit = Math.min(Math.max(Number(rawLimit) || 20, 1), 50);
+-    const r = await fetch(`${ANNOUNCE_URL}?limit=${limit}`, {
+-      headers: { Accept: 'application/json' },
++    const upstreamItems = await readAnnouncements(async () => {
++      const r = await fetch(`${ANNOUNCE_URL}?limit=50`, {
++        headers: { Accept: 'application/json' },
++        signal: AbortSignal.timeout(10_000),
++      });
++      if (!r.ok) throw new Error(`公告源 HTTP ${r.status}`);
++      const data = await r.json();
++      if (data?.ok !== true || !Array.isArray(data.announcements)) throw new Error('公告源响应无效');
++      return data.announcements as Record<string, unknown>[];
+     });
+-    if (!r.ok) {
+-      res.status(502).json({ ok: false, error: 'upstream_failed', status: r.status, announcements: [] });
+-      return;
+-    }
+-    const data = await r.json();
+     const imgOrigin = new URL(ANNOUNCE_URL).origin;
+     // 图片改走同源代理：把绝对遥测台地址改回相对路径（相对路径不变）
+     const toSameOrigin = (c: unknown) =>
+       typeof c === 'string' ? c.split(`](${imgOrigin}/api/announcement-images`).join('](/api/announcement-images') : c;
+-    const list = Array.isArray(data?.announcements)
+-      ? data.announcements.map((a: Record<string, unknown>) => ({ ...a, content: toSameOrigin(a.content) }))
+-      : [];
++    const now = Date.now();
++    const list = upstreamItems
++      .filter(
++        (a) =>
++          (a.publish_at == null || Number(a.publish_at) <= now) &&
++          (a.unpublish_at == null || Number(a.unpublish_at) > now),
++      )
++      .slice(0, limit)
++      .map((a) => ({ ...a, content: toSameOrigin(a.content) }));
+     res.json({ ok: true, announcements: list });
+   } catch (e) {
+     res.status(500).json({ ok: false, error: (e as Error).message, announcements: [] });
+diff --git a/docs/CLASSISLAND-0.3.md b/docs/CLASSISLAND-0.3.md
+new file mode 100644
+index 0000000..a296e87
+--- /dev/null
++++ b/docs/CLASSISLAND-0.3.md
+@@ -0,0 +1,43 @@
++# ClassIsland 考试提醒 0.3.0 配套更新
++
++插件项目：<https://github.com/PikaNova/ClassIsland.ExamReminder>。独立插件仓库是 0.3.0 的发布来源；本次配套改动不替换 integrations 下的历史插件副本。
++
++## 条件同步
++
++继续使用 POST /api/exams、action=plugin-bootstrap，兼容旧客户端。新请求可带：
++
++```json
++{
++  "action": "plugin-bootstrap",
++  "pluginInstanceId": "...",
++  "clientSecret": "...",
++  "knownVersion": "上次收到的version",
++  "includeCompletedToday": true
++}
++```
++
++- 不带 knownVersion 或版本不一致：完整响应额外包含 changed=true、version。
++- 版本一致：返回 ok、API 元信息、changed=false、version、serverTime、viewerOnline；省略 exams 与 binding，客户端保留上次完整数据。
++- 版本覆盖考试 updated_at、年级/班级、绑定浏览器及中国日历日期；午夜重新获取完整数据。
++- 每次仍校验凭据、设备撤销和班级绑定。不能直接对不同凭据共享私有响应。
++- 稳定状态下，一次 JOIN 小查询检查凭据、设备与考试修订，不读取大 JSON，也不更新插件记录。
++- 完整响应仅在班级字段变化时写插件记录。
++- includeCompletedToday=true 保留中国日历当天已结束的考试，使上午/下午整段考试模式能覆盖场间。
++- capability 增加 conditional-sync 和 session-history，API 大版本仍为 2。
++
++不带新字段的旧客户端保持原来的考试过滤窗口与完整响应。
++
++## 作者公告
++
++/api/announcements 的公开作者公告代理增加 60 秒进程内缓存与并发请求合并；不同 limit 共享一次最多 50 条的回源。现有 CDN 缓存头保持不变，发布/撤下时间仍逐次过滤。图片路由保持原行为。
++
++此缓存仅在同一个 warm 进程内共享；多实例或 Serverless 冷启动仍会各自回源，不能据此宣称全局只有一个请求。
++
++## 验证
++
++- plugin.test.ts：版本变化与中国午夜失效，当天已结束考试及旧客户端兼容。
++- announcementCache.test.ts：并发合并、失效重取、失败释放、撤下空列表和代理路由过滤。
++- tests/integration/pluginSync.integration.test.ts：仅允许显式隔离数据库，验证真实 PostgreSQL 完整/轻量响应、不写插件记录、修改、换班、撤销、旧请求和错误凭据。
++- 默认使用仓库 verify:fast；API 改动另跑 typecheck:api。
++
++无需数据库迁移，无需修改部署者环境变量。插件安装与 Novora 更新应配套进行；单独安装插件仍可降级为旧协议完整同步。
+diff --git a/tests/announcementCache.test.ts b/tests/announcementCache.test.ts
+new file mode 100644
+index 0000000..ba32080
+--- /dev/null
++++ b/tests/announcementCache.test.ts
+@@ -0,0 +1,92 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import { createAnnouncementCache } from '../api/_content/announcementCache.js';
++import announcementHandler from '../api/announcements.js';
++import type { VercelRequest, VercelResponse } from '@vercel/node';
++
++test('concurrent callers share one author request; cached reads do not refetch', async () => {
++  const read = createAnnouncementCache();
++  let calls = 0;
++  let finish!: (value: Record<string, unknown>[]) => void;
++  const load = () => {
++    calls++;
++    return new Promise<Record<string, unknown>[]>((resolve) => {
++      finish = resolve;
++    });
++  };
++  const results = [read(load), read(load), read(load)];
++  assert.equal(calls, 1);
++  finish([{ id: 1 }]);
++  await Promise.all(results);
++  assert.deepEqual(await read(load), [{ id: 1 }]);
++  assert.equal(calls, 1);
++});
++
++test('failed author request releases the shared flight and does not cache an empty list', async () => {
++  const read = createAnnouncementCache();
++  await assert.rejects(
++    read(async () => {
++      throw new Error('offline');
++    }),
++    /offline/,
++  );
++  assert.deepEqual(await read(async () => [{ id: 2 }]), [{ id: 2 }]);
++});
++
++test('expired cache refreshes and a successful empty list replaces withdrawn announcements', async () => {
++  const read = createAnnouncementCache(1);
++  await read(async () => [{ id: 1 }]);
++  assert.deepEqual(await read(async () => [], Date.now() + 10), []);
++});
++
++test('announcement proxy shares upstream requests across limits and excludes expired notices', async () => {
++  const original = globalThis.fetch;
++  let calls = 0;
++  globalThis.fetch = (async () => {
++    calls++;
++    return new Response(
++      JSON.stringify({
++        ok: true,
++        announcements: [
++          { id: 1, content: 'active', unpublish_at: Date.now() + 60_000 },
++          { id: 2, content: 'expired', unpublish_at: Date.now() - 1 },
++          { id: 3, content: 'scheduled', publish_at: Date.now() + 60_000 },
++        ],
++      }),
++      { headers: { 'Content-Type': 'application/json' } },
++    );
++  }) as typeof fetch;
++  const bodies: Array<{ announcements: Array<{ id: number }> }> = [];
++  const response = () =>
++    ({
++      setHeader() {
++        return this;
++      },
++      status() {
++        return this;
++      },
++      json(body: (typeof bodies)[number]) {
++        bodies.push(body);
++        return this;
++      },
++    }) as unknown as VercelResponse;
++  try {
++    await Promise.all(
++      [20, 30].map((limit) =>
++        announcementHandler(
++          { method: 'GET', url: '/api/announcements', query: { limit: String(limit) } } as unknown as VercelRequest,
++          response(),
++        ),
++      ),
++    );
++    assert.equal(calls, 1);
++    assert.equal(bodies.length, 2);
++    for (const body of bodies)
++      assert.deepEqual(
++        body.announcements.map((x) => x.id),
++        [1],
++      );
++  } finally {
++    globalThis.fetch = original;
++  }
++});
+diff --git a/tests/integration/pluginSync.integration.test.ts b/tests/integration/pluginSync.integration.test.ts
+new file mode 100644
+index 0000000..d0e96a0
+--- /dev/null
++++ b/tests/integration/pluginSync.integration.test.ts
+@@ -0,0 +1,85 @@
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++import type { VercelRequest, VercelResponse } from '@vercel/node';
++import { database, ensureTableOnce } from '../../api/_exams/db.js';
++import { sha256 } from '../../api/_exams/plugin.js';
++import { handlePluginPairStatusOrBootstrap } from '../../api/_exams/routes/pluginRoutes.js';
++
++test('ClassIsland conditional sync: unchanged, modified, rebound, revoked and legacy clients', async () => {
++  assert.ok(process.env.INTEGRATION_DATABASE_URL, 'run only against an explicitly isolated integration database');
++  assert.equal(process.env.DATABASE_URL, process.env.INTEGRATION_DATABASE_URL);
++  await ensureTableOnce();
++  const sql = database();
++  const now = Date.now();
++  const secret = 'a'.repeat(64);
++  const pluginId = 'classisland-sync-integration';
++  const viewerId = 'classisland-viewer-integration';
++  await sql`INSERT INTO device_instances(instance_id, grade_id, class_id, last_seen_at, updated_at)
++    VALUES (${viewerId}, 'g1', 'c1', ${now}, ${now})`;
++  await sql`INSERT INTO classisland_plugin_instances(plugin_instance_id, client_secret_hash, viewer_instance_id, paired, grade_id, class_id, created_at, updated_at)
++    VALUES (${pluginId}, ${sha256(secret)}, ${viewerId}, TRUE, 'g1', 'c1', ${now}, 123)`;
++  await sql`UPDATE exam_data SET grades='[{"id":"g1","name":"Grade 1"}]'::jsonb,
++    classes='[{"id":"c1","name":"Class 1"},{"id":"c2","name":"Class 2"}]'::jsonb, updated_at=${now} WHERE id=1`;
++
++  async function request(knownVersion?: string, clientSecret = secret) {
++    const result: { code: number; body: Record<string, unknown> } = { code: 200, body: {} };
++    const response = {
++      setHeader() {
++        return this;
++      },
++      status(code: number) {
++        result.code = code;
++        return this;
++      },
++      json(body: Record<string, unknown>) {
++        result.body = body;
++        return this;
++      },
++    } as unknown as VercelResponse;
++    await handlePluginPairStatusOrBootstrap(
++      {
++        method: 'POST',
++        body: { pluginInstanceId: pluginId, clientSecret, knownVersion, includeCompletedToday: true },
++      } as VercelRequest,
++      response,
++      'plugin-bootstrap',
++    );
++    return result;
++  }
++
++  const initial = await request();
++  assert.equal(initial.code, 200);
++  assert.equal(initial.body.changed, true);
++  assert.ok(Array.isArray(initial.body.exams));
++  const version = String(initial.body.version);
++  const [before] =
++    await sql`SELECT xmin::text AS revision, updated_at FROM classisland_plugin_instances WHERE plugin_instance_id=${pluginId}`;
++  const unchanged = await request(version);
++  assert.equal(unchanged.body.changed, false);
++  assert.equal(unchanged.body.version, version);
++  assert.equal(unchanged.body.viewerOnline, true);
++  assert.equal('exams' in unchanged.body, false);
++  const [after] =
++    await sql`SELECT xmin::text AS revision, updated_at FROM classisland_plugin_instances WHERE plugin_instance_id=${pluginId}`;
++  assert.equal(after.revision, before.revision, 'unchanged sync must not write the plugin row');
++  assert.equal(Number(after.updated_at), 123);
++
++  await sql`UPDATE exam_data SET updated_at=${now + 1} WHERE id=1`;
++  const changed = await request(version);
++  assert.equal(changed.body.changed, true);
++  assert.notEqual(changed.body.version, version);
++  await sql`UPDATE device_instances SET class_id='c2' WHERE instance_id=${viewerId}`;
++  const rebound = await request(String(changed.body.version));
++  assert.equal(rebound.body.changed, true);
++  assert.equal((rebound.body.binding as Record<string, unknown>).classId, 'c2');
++  assert.equal((await request(undefined)).body.changed, true, 'legacy request still receives a complete response');
++  assert.equal((await request(undefined, 'b'.repeat(64))).code, 401);
++  await sql`UPDATE device_instances SET revoked=TRUE WHERE instance_id=${viewerId}`;
++  assert.equal(
++    (await request(String(rebound.body.version))).code,
++    409,
++    'revocation is validated before any unchanged reply',
++  );
++  await sql`DELETE FROM classisland_plugin_instances WHERE plugin_instance_id=${pluginId}`;
++  await sql`DELETE FROM device_instances WHERE instance_id=${viewerId}`;
++});
+diff --git a/tests/plugin.test.ts b/tests/plugin.test.ts
+index 715c522..56c880e 100644
+--- a/tests/plugin.test.ts
++++ b/tests/plugin.test.ts
+@@ -8,6 +8,7 @@ import {
+   classLabel,
+   equalHash,
+   pluginCredentials,
++  pluginSyncVersion,
+   resolvePluginExams,
+   sha256,
+ } from '../api/_exams/plugin.js';
+@@ -122,6 +123,38 @@ test('classIslandApiMeta reports the declared version and capabilities', () => {
+   assert.deepEqual(meta.capabilities, CLASSISLAND_API_CAPABILITIES);
+ });
+ 
++test('conditional version invalidates on data revision, binding, viewer and China midnight', () => {
++  const before = Date.parse('2026-10-18T23:59:59+08:00');
++  const version = pluginSyncVersion(100, 'g1', 'c1', 'viewer1', before);
++  assert.equal(version, pluginSyncVersion('100', 'g1', 'c1', 'viewer1', before - 1000));
++  assert.notEqual(version, pluginSyncVersion(101, 'g1', 'c1', 'viewer1', before));
++  assert.notEqual(version, pluginSyncVersion(100, 'g2', 'c1', 'viewer1', before));
++  assert.notEqual(version, pluginSyncVersion(100, 'g1', 'c2', 'viewer1', before));
++  assert.notEqual(version, pluginSyncVersion(100, 'g1', 'c1', 'viewer2', before));
++  assert.notEqual(version, pluginSyncVersion(100, 'g1', 'c1', 'viewer1', before + 1000));
++});
++
++test('session history retains completed exams today while legacy clients keep the old window', () => {
++  const originalNow = Date.now;
++  Date.now = () => Date.parse('2026-10-18T10:00:00+08:00');
++  try {
++    const payload = payloadWithMajor({
++      id: 'am1',
++      name: 'Math',
++      startTime: '2026-10-18T08:00',
++      endTime: '2026-10-18T09:00',
++      enabled: true,
++      order: 0,
++    });
++    assert.equal(resolvePluginExams(payload, 'grade-1', 'class-1').length, 0);
++    assert.equal(resolvePluginExams(payload, 'grade-1', 'class-1', true).length, 1);
++    Date.now = () => Date.parse('2026-10-19T10:00:00+08:00');
++    assert.equal(resolvePluginExams(payload, 'grade-1', 'class-1', true).length, 0);
++  } finally {
++    Date.now = originalNow;
++  }
++});
++
+ test('classLabel joins matched grade and class names', () => {
+   assert.equal(classLabel(makePayload(), 'grade-1', 'class-1'), 'Grade 3 Class 1');
+ });

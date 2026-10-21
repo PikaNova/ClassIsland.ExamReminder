@@ -17,9 +17,12 @@ public class Plugin : PluginBase
         services.AddSingleton<ExamBoardClient>();
         services.AddSingleton<ExternalUriLauncher>();
         services.AddSingleton<ExamReminderProvider>();
+        services.AddSingleton<ReminderSuppressionService>();
         services.AddSettingsPage<ExamReminderSettingsPage>();
         services.AddNotificationProvider<ExamReminderProvider>();
         services.AddSingleton<ExamSyncService>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<ExamSyncService>());
+        services.AddSingleton<AnnouncementService>();
+        services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<AnnouncementService>());
     }
 }

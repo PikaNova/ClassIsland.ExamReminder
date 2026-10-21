@@ -14,11 +14,15 @@ public static class ExamBoardUrls
             return false;
         }
 
-        var isLocalHttp = uri.Scheme == Uri.UriSchemeHttp &&
-            (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || uri.IsLoopback);
-        if (uri.Scheme != Uri.UriSchemeHttps && !isLocalHttp)
+        if (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp)
         {
-            error = "考试看板网址必须使用 HTTPS；本机调试可使用 localhost HTTP";
+            error = "考试看板网址必须使用 HTTP 或 HTTPS";
+            return false;
+        }
+
+        if (!string.IsNullOrEmpty(uri.UserInfo))
+        {
+            error = "请勿在网址中填写用户名或密码";
             return false;
         }
 

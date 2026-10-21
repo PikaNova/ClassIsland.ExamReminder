@@ -1,0 +1,21 @@
+{
+  "seq": 0,
+  "gradeId": "drill-grade-1",
+  "classId": "drill-class-1",
+  "classTag": "高一(3)班 · 演练",
+  "exams": [],
+  "announcements": [],
+  "pairedTokens": {
+    "69a0011adcdcb98fa128c199b720f975b8906e20b0a772416232cded63097e05": {
+      "instance": "classisland-17d13c6253f64197972bb5caea990bc2",
+      "approved": true
+    },
+    "b214b61726fff292565d438724893f2333397e79f2f98bdbfab4a9fa58d40f9c": {
+      "instance": "classisland-17d13c6253f64197972bb5caea990bc2",
+      "approved": true
+    }
+  },
+  "viewerOnline": true,
+  "failBootstrap": false,
+  "honorLightSync": true
+}

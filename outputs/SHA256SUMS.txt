@@ -1,0 +1,3 @@
+20fb27377d2854cfd1df4b98b84dd075776785cffb4ce065c3b269d6e609fe0f  ClassIsland.ExamReminder-0.3.2.1.cipx
+aa434754d003e70fd1d1b7850e02d47fdc734ca0b4811020de7f504d30953ef7  ClassIsland.ExamReminder-0.3.2.1-source.zip
+3470cefadfbe42f29d1699f5eab0f1a0d844614e867970fc30d492ec4b5dcf2c  Novora-ClassIsland-0.3.patch
