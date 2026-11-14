@@ -33,7 +33,19 @@ internal static class Program
         try
         {
             AppBuilder.Configure<CheckApp>().UseSkia().UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false }).SetupWithoutStarting();
+            if (args.Length == 1 && args[0] == "--online-only")
+            {
+                OnlineProtocolChecks().GetAwaiter().GetResult();
+                Console.WriteLine("PASS: online protocol checks");
+                return 0;
+            }
             BasicChecks();
+            OnlineProtocolChecks().GetAwaiter().GetResult();
+            if (args.Length == 1 && args[0] == "--standalone")
+            {
+                Console.WriteLine($"PASS: {_checks} standalone checks; host integration was not run.");
+                return 0;
+            }
             if (args.Length == 0) throw new ArgumentException("Pass the ClassIsland 2.1.0.1 app directory to run host integration and UI checks.");
             HostChecks(Path.GetFullPath(args[0]));
             Console.WriteLine($"PASS: {_checks} checks");
@@ -77,6 +89,59 @@ internal static class Program
         Check(ExamSchedule.Phase(exams[0], exams[0].StartAt.AddMinutes(-1)) == "待开始" &&
               ExamSchedule.Phase(exams[0], exams[0].StartAt.AddMinutes(1)) == "进行中" &&
               ExamSchedule.Phase(exams[0], exams[0].EndAt) == "已结束", "exam phase follows start and end times");
+        var pausedExam = new ExamBoardExam { Id = "Paused", Name = "Paused", StartAt = exams[0].StartAt,
+            EndAt = exams[0].EndAt, PausedAt = exams[0].StartAt.AddMinutes(30) };
+        Check(ExamSchedule.Phase(pausedExam, exams[0].EndAt.AddMinutes(10)) == "已暂停" &&
+              !ExamSchedule.IsDue(pausedExam, 0, exams[0].StartAt, 120) &&
+              !ExamSchedule.IsEndDue(pausedExam, 0, exams[0].EndAt, 120), "paused exams freeze phase and suppress start/end alerts");
+        var afterOriginalEnd = exams[0].EndAt.AddMinutes(30);
+        var statusPausedExam = System.Text.Json.JsonSerializer.Deserialize<ExamBoardExam>(
+            "{\"id\":\"Math\",\"name\":\"Math\",\"startAt\":\"2026-10-18T00:00:00Z\",\"endAt\":\"2026-10-18T01:30:00Z\",\"status\":\"paused\"}")!;
+        Check(ExamSchedule.Phase(statusPausedExam, afterOriginalEnd) == "已暂停" &&
+              ExamSchedule.IsStillRelevant(statusPausedExam, afterOriginalEnd) &&
+              !ExamSchedule.IsDue(statusPausedExam, 0, exams[0].StartAt, 120) &&
+              !ExamSchedule.IsEndDue(statusPausedExam, 0, exams[0].EndAt, 120),
+            "explicit paused status survives JSON parsing and suppresses ordinary alerts");
+        Check(ExamSchedule.Changes([exams[0]], [statusPausedExam], s, afterOriginalEnd).Single().Detail.Contains("后台已暂停考试"),
+            "explicit paused status triggers the backend pause reminder after original end");
+        Check(ExamSchedule.IsStillRelevant(pausedExam, afterOriginalEnd) &&
+              ExamSchedule.EffectiveEndAt(pausedExam, afterOriginalEnd) > afterOriginalEnd,
+            "paused exam stays visible beyond the original end and extends by the in-flight pause");
+        var pausedFromYesterday = new ExamBoardExam { Id = "YesterdayPaused", Name = "Yesterday",
+            StartAt = exams[0].StartAt.AddDays(-1), EndAt = exams[0].EndAt.AddDays(-1), PausedAt = exams[0].StartAt };
+        Check(ExamSchedule.Today([pausedFromYesterday], s, afterOriginalEnd).Count == 1,
+            "paused exam remains in today's schedule after crossing midnight");
+        var resumedExam = new ExamBoardExam { Id = pausedExam.Id, Name = pausedExam.Name, StartAt = pausedExam.StartAt,
+            EndAt = exams[0].EndAt.AddHours(1), PausedMs = 60 * 60 * 1000 };
+        var pauseChanges = ExamSchedule.Changes([pausedExam], [resumedExam], s, afterOriginalEnd.AddMinutes(-10));
+        Check(pauseChanges.Count == 1 && pauseChanges[0].Detail.Contains("后台已继续考试"),
+            "resume after original end is still reported as a schedule change");
+        var resumedAfterPause = new ExamBoardExam { Id = exams[0].Id, Name = exams[0].Name,
+            StartAt = exams[0].StartAt, EndAt = exams[0].EndAt.AddHours(1), PausedMs = 60 * 60 * 1000 };
+        var pauseAndResumeBetweenSyncs = ExamSchedule.Changes([exams[0]], [resumedAfterPause], s,
+            afterOriginalEnd.AddMinutes(-10));
+        Check(pauseAndResumeBetweenSyncs.Count == 1 && pauseAndResumeBetweenSyncs[0].Detail.Contains("结束"),
+            "pause and resume between syncs still reports the extended end time after original end");
+        var pauseNow = exams[0].EndAt.AddMinutes(20);
+        var pausedSession = ExamSchedule.Sessions([pausedExam], s, pauseNow).Single();
+        Check(pausedSession.End > pauseNow, "exam mode stays active while an exam is paused beyond its planned end");
+        var reminderTypes = new PluginSettings { EnableDayBeforeReminder = true };
+        ExamSchedule.SetReminderTypeEnabled(reminderTypes, ReminderType.Start, false);
+        ExamSchedule.SetReminderTypeEnabled(reminderTypes, ReminderType.ScheduleChange, false);
+        Check(!ExamSchedule.IsReminderTypeEnabled(reminderTypes, ReminderType.Start) &&
+              !ExamSchedule.IsReminderTypeEnabled(reminderTypes, ReminderType.ScheduleChange) &&
+              ExamSchedule.IsReminderTypeEnabled(reminderTypes, ReminderType.Upcoming) &&
+              ExamSchedule.IsReminderTypeEnabled(reminderTypes, ReminderType.BeforeEnd) &&
+              ExamSchedule.IsReminderTypeEnabled(reminderTypes, ReminderType.Ended) &&
+              ExamSchedule.IsReminderTypeEnabled(reminderTypes, ReminderType.DayBefore),
+            "reminder type selection maps every supported reminder category");
+        var providerControl = new ExamReminderProviderSettingsControl(new PluginSettingsStore(
+            Path.Combine(Path.GetTempPath(), "examreminder-provider-settings-" + Guid.NewGuid().ToString("N"))));
+        Check(providerControl.Content is StackPanel providerPanel &&
+              providerPanel.Children.OfType<CheckBox>().Count() == ExamSchedule.ReminderTypes.Count,
+            "notification provider settings expose every reminder type");
+        Capture(providerControl, "provider-settings-light.png", ThemeVariant.Light, 420, 650, 0);
+        Capture(providerControl, "provider-settings-dark.png", ThemeVariant.Dark, 420, 650, 0);
         Check(PluginSettings.DefaultSuppressedProviderIds.SequenceEqual(new PluginSettings().SuppressedProviders), "default suppressed providers stay in sync");
         Check(ExamSchedule.IsDue(exams[0], 15, exams[0].StartAt.AddMinutes(-15).AddSeconds(30), 120), "late tick within configured grace triggers");
         Check(!ExamSchedule.IsDue(exams[0], 15, exams[0].StartAt.AddMinutes(-5), 120), "expired reminder does not replay");
@@ -124,6 +189,15 @@ internal static class Program
         var cancelled = ExamSchedule.Changes(exams, [exams[0]], s, diffNow);
         Check(cancelled.Count == 2 && cancelled.All(x => x.Detail.StartsWith("取消 原定") && x.Key.Contains("|removed|")) &&
               cancelled.Any(x => x.Title == "Language"), "future exams missing from the new schedule are reported as cancelled");
+        var lifecycle = new ExamBoardLifecycleState { ReminderKey = "major:ended-major:Math", MajorExamId = "ended-major", Status = "ended",
+            ChangedAt = DateTimeOffset.Parse("2026-10-18T07:30+08:00") };
+        var lifecycleExam = new ExamBoardExam { Id = exams[0].Id, Name = exams[0].Name, StartAt = exams[0].StartAt,
+            EndAt = exams[0].EndAt, ReminderKey = lifecycle.ReminderKey };
+        var lifecycleChange = ExamSchedule.Changes([lifecycleExam], [], s, diffNow, [lifecycle], true);
+        Check(lifecycleChange.Count == 1 && lifecycleChange[0].Detail.Contains("后台提前结束") &&
+              !lifecycleChange[0].Detail.StartsWith("取消"), "lifecycle state distinguishes early end from schedule cancellation");
+        Check(ExamSchedule.Changes([exams[0]], [], s, diffNow, [], true).Count == 0,
+            "explicit lifecycle protocol does not mislabel a scope removal as cancellation");
         Check(ExamSchedule.Changes([Exam("Done", "2026-10-17T08:00+08:00", "2026-10-17T09:30+08:00")], [], s, diffNow).Count == 0,
             "finished exams dropped from the schedule are not reported as cancelled");
         Check(!ExamSchedule.Changes(exams, [new ExamBoardExam { Id = "Math", Name = "Math",
@@ -147,7 +221,9 @@ internal static class Program
         s.ReminderMinutes = []; s.EndReminderMinutes = []; s.EnableExamEndReminder = false; s.SyncSeconds = 1; PluginSettingsStore.Normalize(s);
         Check(s.ReminderMinutes.Count == 0 && s.EndReminderMinutes.Count == 0 && !s.EnableExamEndReminder, "empty reminder lists stay disabled; sync interval is bounded");
         var defaults = new PluginSettings(); PluginSettingsStore.Normalize(defaults);
-        Check(defaults.EndReminderMinutes!.SequenceEqual([15, 5]) && defaults.EnableExamEndReminder, "end reminders are enabled by default");
+        Check(defaults.EndReminderMinutes!.SequenceEqual([15, 5]) && defaults.EnableBeforeStartReminder &&
+              defaults.EnableStartReminder && defaults.EnableBeforeEndReminder && defaults.EnableExamEndReminder &&
+              defaults.EnableExamChangeReminder, "exam reminder types are enabled by default");
         Check(defaults.EnableExamChangeReminder && defaults.ExamChangeTemplate.Contains("{变更}"), "exam change reminders are enabled by default");
         var folder = Path.Combine(Path.GetTempPath(), "exam-reminder-check-" + Guid.NewGuid().ToString("N"));
         var store = new PluginSettingsStore(folder);
@@ -158,6 +234,120 @@ internal static class Program
         File.WriteAllText(Path.Combine(folder, "Settings.json"), "broken");
         var damaged = new PluginSettingsStore(folder);
         Check(damaged.SaveError is not null && File.ReadAllText(Path.Combine(folder, "Settings.json")) == "broken", "damaged config is reported and not overwritten on load");
+    }
+
+    private static async Task OnlineProtocolChecks()
+    {
+        const string pairToken = "A7D8fG1hJ3kL5mN7pQ9rS1tV3wX5yZ7aB9cD1eF3gHk";
+        var folder = Path.Combine(Path.GetTempPath(), "exam-reminder-online-protocol-" + Guid.NewGuid().ToString("N"));
+        var store = new PluginSettingsStore(folder);
+        store.Update(s => { s.ServiceMode = "online"; s.BaseUrl = "https://online.example.test"; s.PendingPairToken = pairToken; });
+        Check(store.Settings.ClientSecret.Length == 64 && store.Settings.ClientSecret.All(Uri.IsHexDigit),
+            "plugin instance secrets keep the school server's existing hexadecimal format");
+        using var handler = new ProtocolHandler();
+        using var http = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+        using var client = new ExamBoardClient(store, http);
+        var pairExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeMilliseconds();
+
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true,
+            pairUrl = $"https://online.example.test/online/plugin/connect?token={Uri.EscapeDataString(pairToken)}", expiresAt = pairExpiresAt }));
+        var start = await client.StartPairingAsync(store.Settings.BaseUrl, store.Settings.PluginInstanceId,
+            store.Settings.ClientSecret, pairToken, online: true);
+        Check(start.IsSuccess && start.Value!.PairUrl.AbsolutePath == "/online/plugin/connect" &&
+              start.Value.ExpiresAt == pairExpiresAt && handler.LastUri!.AbsolutePath == "/api/online" &&
+              !start.Value.PairUrl.Query.Contains(store.Settings.ClientSecret, StringComparison.Ordinal),
+            "online pair start uses the online API and accepts the returned HTTPS pairing URL");
+        using (var body = JsonDocument.Parse(handler.LastBody!))
+        {
+            Check(body.RootElement.GetProperty("action").GetString() == "plugin-pair-start" &&
+                  body.RootElement.GetProperty("pairToken").GetString() == pairToken &&
+                  !body.RootElement.TryGetProperty("apiVersion", out _),
+                "online pairing request uses the online-specific contract");
+        }
+
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true,
+            pairUrl = $"https://attacker.example.test/online/plugin/connect?token={Uri.EscapeDataString(pairToken)}", expiresAt = 1_800_000_000_000L }));
+        Check(!(await client.StartPairingAsync(store.Settings.BaseUrl, store.Settings.PluginInstanceId,
+            store.Settings.ClientSecret, pairToken, online: true)).IsSuccess,
+            "online pairing rejects a URL hosted outside the configured service");
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true,
+            pairUrl = $"https://online.example.test/online/plugin/connect?token={Uri.EscapeDataString(pairToken)}&token=other", expiresAt = 1_800_000_000_000L }));
+        Check(!(await client.StartPairingAsync(store.Settings.BaseUrl, store.Settings.PluginInstanceId,
+            store.Settings.ClientSecret, pairToken, online: true)).IsSuccess,
+            "online pairing rejects duplicate token parameters without throwing");
+
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true, status = "pending", expiresAt = 1_800_000_000_000L }));
+        var pairStatus = await client.GetPairStatusAsync(store.Settings);
+        Check(pairStatus.IsSuccess && pairStatus.Value!.Status == "pending" &&
+              handler.LastBody!.Contains("\"action\":\"plugin-pair-status\"", StringComparison.Ordinal) &&
+              handler.LastBody.Contains(pairToken, StringComparison.Ordinal),
+            "online pair polling sends the instance credentials and pending pair token");
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true, status = "confirmed",
+            expiresAt = 1_800_000_000_000L, deviceId = "device-123" }));
+        pairStatus = await client.GetPairStatusAsync(store.Settings);
+        Check(pairStatus.IsSuccess && pairStatus.Value!.Status == "confirmed" && pairStatus.Value.DeviceId == "device-123",
+            "online pairing exposes a confirmed device only after website authorization");
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true, status = "expired", expiresAt = 1_700_000_000_000L }));
+        pairStatus = await client.GetPairStatusAsync(store.Settings);
+        Check(pairStatus.IsSuccess && pairStatus.Value!.Status == "expired" && pairStatus.Value.DeviceId is null,
+            "online pairing reports expiry without returning a device identity");
+
+        var serverTime = DateTimeOffset.Parse("2026-11-14T04:05:06Z").ToUnixTimeMilliseconds();
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true, apiVersion = 1,
+            capabilities = new[] { "online-exam-v1" }, serverTime, version = "exam-123:4", changed = true,
+            exam = new { id = "exam-123", title = "期中考试", timezone = "Asia/Shanghai", items = new[] {
+                new { id = "subject-1", name = "数学", startAt = "2026-11-14T08:00:00+08:00", endAt = "2026-11-14T09:30:00+08:00", note = "一号楼", sourceName = "期中考试" }
+            } } }));
+        var bootstrap = await client.GetBootstrapAsync(store.Settings);
+        Check(bootstrap.IsSuccess && bootstrap.Value!.ServerTime.ToUnixTimeMilliseconds() == serverTime &&
+              bootstrap.Value.Version == "exam-123:4" && bootstrap.Value.TimeZoneId == "Asia/Shanghai" &&
+              bootstrap.Value.Exams.Single().Name == "数学" && bootstrap.Value.Exams.Single().Note == "一号楼" &&
+              bootstrap.Value.Exams.Single().StartAt == DateTimeOffset.Parse("2026-11-14T08:00:00+08:00"),
+            "online published snapshot maps Unix server time, timezone and ISO exam times");
+
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true, apiVersion = 1,
+            capabilities = new[] { "online-exam-v1" }, serverTime, version = "exam-123:4", changed = false }));
+        var unchanged = await client.GetBootstrapAsync(store.Settings, "exam-123:4");
+        Check(unchanged.IsSuccess && !unchanged.Value!.Changed && unchanged.Value.Exams.Count == 0 &&
+              handler.LastBody!.Contains("\"knownVersion\":\"exam-123:4\"", StringComparison.Ordinal),
+            "online unchanged bootstrap preserves opaque knownVersion without requiring an exam body");
+
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true, apiVersion = 1,
+            capabilities = Array.Empty<string>(), serverTime, version = "exam-123:4", changed = false }));
+        Check(!(await client.GetBootstrapAsync(store.Settings, "exam-123:4")).IsSuccess,
+            "online bootstrap rejects responses missing the required capability");
+
+        store.Update(s => s.ServiceMode = "online");
+        handler.Failures.Enqueue((HttpStatusCode.Forbidden,
+            "{\"ok\":false,\"code\":\"ENTITLEMENT_SUSPENDED\",\"error\":\"Suspended\"}"));
+        var suspended = await client.GetBootstrapAsync(store.Settings, "exam-123:4");
+        Check(!suspended.IsSuccess && suspended.ErrorCode == "ENTITLEMENT_SUSPENDED" &&
+              suspended.Error?.Contains("已暂停", StringComparison.Ordinal) == true,
+            "online service errors retain stable codes and localized entitlement feedback");
+
+        store.Update(s => s.ServiceMode = "school");
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true, apiVersion = 2, schemaVersion = 2,
+            capabilities = new[] { "conditional-sync-v2" }, serverTime = DateTimeOffset.FromUnixTimeMilliseconds(serverTime),
+            version = "school-v2", changed = false, viewerOnline = true, binding = new { classTag = "高一（3）班" }, exams = Array.Empty<object>() }));
+        var school = await client.GetBootstrapAsync(store.Settings, "school-v1");
+        Check(school.IsSuccess && handler.LastUri!.AbsolutePath == "/api/exams" &&
+              handler.LastBody!.Contains("\"apiVersion\":2", StringComparison.Ordinal) &&
+              handler.LastBody.Contains("\"includeCompletedToday\":true", StringComparison.Ordinal),
+            "school mode keeps its original API path and request fields");
+        handler.Responses.Enqueue(JsonSerializer.Serialize(new { ok = true }));
+        const string schoolPairToken = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var schoolPair = await client.StartPairingAsync(store.Settings.BaseUrl, store.Settings.PluginInstanceId,
+            store.Settings.ClientSecret, schoolPairToken);
+        Check(schoolPair.IsSuccess && schoolPair.Value!.PairUrl.AbsolutePath == "/plugin/connect" &&
+              handler.LastUri!.AbsolutePath == "/api/exams" &&
+              handler.LastBody!.Contains("\"apiVersion\":2", StringComparison.Ordinal) &&
+              handler.LastBody.Contains(schoolPairToken, StringComparison.Ordinal),
+            "school mode keeps its original pair endpoint, response URL and API version field");
+
+        var insecure = await client.StartPairingAsync("http://online.example.test", store.Settings.PluginInstanceId,
+            store.Settings.ClientSecret, pairToken, online: true);
+        Check(!insecure.IsSuccess && handler.Calls == 12,
+            "online mode refuses HTTP before making a network request");
     }
 
     private static void HostChecks(string hostFolder)
@@ -380,4 +570,35 @@ internal sealed class FakeServer : IDisposable
         });
     }
     public void Dispose() { _listener.Stop(); _listener.Close(); }
+}
+
+internal sealed class ProtocolHandler : HttpMessageHandler
+{
+    public Queue<string> Responses { get; } = new();
+    public Queue<(HttpStatusCode Status, string Body)> Failures { get; } = new();
+    public Uri? LastUri { get; private set; }
+    public string? LastBody { get; private set; }
+    public int Calls { get; private set; }
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        Calls++;
+        LastUri = request.RequestUri;
+        LastBody = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
+        if (request.RequestUri!.AbsolutePath is not ("/api/online" or "/api/exams"))
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        if (Failures.Count > 0)
+        {
+            var failure = Failures.Dequeue();
+            return new HttpResponseMessage(failure.Status)
+            {
+                Content = new StringContent(failure.Body, Encoding.UTF8, "application/json")
+            };
+        }
+        if (Responses.Count == 0) return new HttpResponseMessage(HttpStatusCode.InternalServerError);
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(Responses.Dequeue(), Encoding.UTF8, "application/json")
+        };
+    }
 }

@@ -145,7 +145,8 @@ public sealed class ExamSyncService : BackgroundService
 
     public bool TryShowCurrentOrNextExamReminder(out string error)
     {
-        var exam = Exams.Where(x => x.EndAt > Now).OrderBy(x => x.StartAt).FirstOrDefault();
+        var exam = Exams.Where(x => ExamSchedule.IsStillRelevant(x, Now))
+            .OrderBy(x => x.StartAt).FirstOrDefault();
         if (exam is null) { error = "没有可用于测试的考试，请先同步考试数据"; return false; }
         _provider.ShowExamReminder(exam, exam.StartAt - Now, ExamReminderKind.BeforeStart, OfflineWarning);
         error = "";
@@ -158,26 +159,68 @@ public sealed class ExamSyncService : BackgroundService
         var requestVersion = Interlocked.Read(ref _syncRequestVersion);
         // An independent copy prevents pairing edits from changing an in-flight request.
         var current = _store.Settings;
-        var settings = new PluginSettings { BaseUrl = current.BaseUrl, PluginInstanceId = current.PluginInstanceId, ClientSecret = current.ClientSecret,
-            IsPaired = current.IsPaired, PendingPairToken = current.PendingPairToken, PairExpiresAt = current.PairExpiresAt };
+        var settings = new PluginSettings { ServiceMode = current.ServiceMode, BaseUrl = current.BaseUrl, PluginInstanceId = current.PluginInstanceId,
+            ClientSecret = current.ClientSecret, IsPaired = current.IsPaired, PendingPairToken = current.PendingPairToken,
+            PairExpiresAt = current.PairExpiresAt, BoundDeviceId = current.BoundDeviceId, OnlineTimeZoneId = current.OnlineTimeZoneId };
         Interlocked.Exchange(ref _nextSyncMs, long.MaxValue);
         LastAttemptAt = DateTimeOffset.Now;
         try
         {
             if (string.IsNullOrWhiteSpace(settings.BaseUrl)) { Schedule(60); return; }
-            if (!settings.IsPaired)
+            if (!settings.IsPaired || (settings.ServiceMode == "online" && !string.IsNullOrWhiteSpace(settings.PendingPairToken)))
             {
                 if (string.IsNullOrWhiteSpace(settings.PendingPairToken)) { Schedule(60); return; }
-                if (settings.PairExpiresAt <= DateTimeOffset.Now)
+                if (settings.ServiceMode != "online" && settings.PairExpiresAt <= DateTimeOffset.Now)
                 {
                     _store.Update(s => { s.PendingPairToken = ""; s.PairExpiresAt = null; s.LastStatus = "浏览器绑定已过期，请重新连接"; });
                     Schedule(60); return;
                 }
                 var pair = await _client.GetPairStatusAsync(settings, token);
                 if (generation != Interlocked.Read(ref _generation)) return;
-                if (!pair.IsSuccess || pair.Value?.Ok != true) { Failure(pair.Error ?? "无法查询配对状态", pair.RetryAfter); return; }
-                if (!pair.Value.Paired) { Status("等待浏览器完成班级配对"); Schedule(5, false); return; }
-                _store.Update(s => { s.IsPaired = true; s.BoundClassTag = pair.Value.ClassTag ?? ""; s.PendingPairToken = ""; s.PairExpiresAt = null; });
+                if (!pair.IsSuccess || pair.Value?.Ok != true)
+                {
+                    if (settings.ServiceMode == "online" && pair.ErrorCode is ("PAIR_EXPIRED" or "PAIR_NOT_FOUND"))
+                    {
+                        _store.Update(s => { s.PendingPairToken = ""; s.PairExpiresAt = null; s.LastStatus = pair.Error ?? "网页配对已过期，请重新连接"; });
+                        if (!settings.IsPaired) { Schedule(60); return; }
+                    }
+                    else { Failure(pair.Error ?? "无法查询配对状态", pair.RetryAfter); return; }
+                }
+                else if (settings.ServiceMode == "online")
+                {
+                    var pairStatus = pair.Value.Status;
+                    if (pairStatus == "pending")
+                    {
+                        Status("等待网页确认考试绑定");
+                        if (!settings.IsPaired) { Schedule(5, false); return; }
+                    }
+                    else if (pairStatus == "expired")
+                    {
+                        _store.Update(s => { s.PendingPairToken = ""; s.PairExpiresAt = null; s.LastStatus = "网页配对已过期，请重新连接"; });
+                        if (!settings.IsPaired) { Schedule(60); return; }
+                    }
+                    else if (pairStatus == "confirmed" && !string.IsNullOrWhiteSpace(pair.Value.DeviceId))
+                    {
+                        if (!string.Equals(settings.BoundDeviceId, pair.Value.DeviceId, StringComparison.Ordinal))
+                        {
+                            ForgetSnapshot();
+                            _lastFullSync = DateTimeOffset.MinValue;
+                            _store.Update(s =>
+                            {
+                                s.BoundDeviceId = pair.Value.DeviceId!;
+                                s.BoundClassTag = "";
+                                s.BoundGradeId = s.BoundClassId = "";
+                            });
+                        }
+                        _store.Update(s => { s.IsPaired = true; s.PendingPairToken = ""; s.PairExpiresAt = null; });
+                    }
+                    else { Failure("在线服务返回了无效的配对状态"); return; }
+                }
+                else
+                {
+                    if (!pair.Value.Paired) { Status("等待浏览器完成班级配对"); Schedule(5, false); return; }
+                    _store.Update(s => { s.IsPaired = true; s.BoundClassTag = pair.Value.ClassTag ?? ""; s.PendingPairToken = ""; s.PairExpiresAt = null; });
+                }
             }
 
             var full = _snapshot is null || DateTimeOffset.UtcNow - _lastFullSync >= TimeSpan.FromMinutes(_store.Settings.FullSyncMinutes);
@@ -187,7 +230,27 @@ public sealed class ExamSyncService : BackgroundService
             if (generation != Interlocked.Read(ref _generation)) return;
             if (!result.IsSuccess || result.Value?.Ok != true)
             {
-                if (result.StatusCode is 401 or 403 or 409)
+                if (settings.ServiceMode == "online" && result.ErrorCode is ("ENTITLEMENT_PENDING" or "ENTITLEMENT_SUSPENDED" or "ENTITLEMENT_EXPIRED"))
+                {
+                    ForgetSnapshot();
+                    Status(result.Error ?? "在线服务权益当前不可用");
+                    Failure(result.Error ?? "在线服务权益当前不可用", result.RetryAfter);
+                    return;
+                }
+                if (settings.ServiceMode == "online" && result.ErrorCode is ("AUTH_REQUIRED" or "DEVICE_REVOKED" or "DEVICE_EXPIRED" or "EXAM_ARCHIVED"))
+                {
+                    ForgetSnapshot();
+                    _store.Update(s =>
+                    {
+                        s.IsPaired = false;
+                        s.PendingPairToken = "";
+                        s.PairExpiresAt = null;
+                        s.BoundDeviceId = "";
+                        s.BoundClassTag = "";
+                        s.BoundGradeId = s.BoundClassId = "";
+                    });
+                }
+                else if (settings.ServiceMode != "online" && result.StatusCode is (401 or 403 or 409))
                 {
                     _snapshot = null;
                     _suppression.SetActive(false);
@@ -201,6 +264,11 @@ public sealed class ExamSyncService : BackgroundService
             if (data.ServerTime.Year < 2020 || data.ServerTime.Year > 2200 || (data.Changed && (data.Exams is null || data.Exams.Any(x =>
                 string.IsNullOrWhiteSpace(x.Id) || string.IsNullOrWhiteSpace(x.Name) || x.StartAt.Year < 2020 || x.EndAt <= x.StartAt))))
             { Failure("考试数据或服务器时间无效，保留上次有效数据"); return; }
+            if (settings.ServiceMode == "online" && data.Changed)
+            {
+                try { _ = TimeZoneInfo.FindSystemTimeZoneById(data.TimeZoneId); }
+                catch { Failure("在线服务返回的考试时区无效，保留上次有效数据"); return; }
+            }
             if (!data.Changed && (_snapshot is null || string.IsNullOrEmpty(data.Version) || data.Version != _snapshot.Version))
             { _lastFullSync = DateTimeOffset.MinValue; Failure("轻量同步版本不一致，等待完整校验"); return; }
 
@@ -209,10 +277,12 @@ public sealed class ExamSyncService : BackgroundService
                 // Preserve the complete schedule when the server returns only status.
                 data.Exams = _snapshot!.Exams;
                 data.Binding = _snapshot.Binding;
+                data.Lifecycle = _snapshot.Lifecycle;
+                data.TimeZoneId = _snapshot.TimeZoneId;
             }
             else
             {
-                if (!data.Capabilities.Contains("session-history") && _snapshot is {} previous &&
+                if (settings.ServiceMode != "online" && data.Capabilities?.Contains("session-history", StringComparer.Ordinal) != true && _snapshot is {} previous &&
                     data.Binding?.ClassTag is {} classTag && classTag == previous.Binding?.ClassTag)
                 {
                     var today = TimeZoneInfo.ConvertTime(data.ServerTime, ExamSchedule.TimeZone(_store.Settings)).Date;
@@ -240,7 +310,8 @@ public sealed class ExamSyncService : BackgroundService
                     old.Binding.ClassId == data.Binding.ClassId))
             {
                 var changeScope = Scope(_store.Settings) + "|change|";
-                var pending = ExamSchedule.Changes(old.Exams, data.Exams, _store.Settings, Now)
+                var pending = ExamSchedule.Changes(old.Exams, data.Exams, _store.Settings, Now, data.Lifecycle,
+                        data.Capabilities?.Contains("exam-lifecycle", StringComparer.Ordinal) == true)
                     .Where(x => !_store.HasCompletedAction(changeScope + x.Key)).ToList();
                 if (pending.Count > 0)
                 {
@@ -248,13 +319,15 @@ public sealed class ExamSyncService : BackgroundService
                     foreach (var change in pending) _store.MarkCompletedAction(changeScope + change.Key);
                 }
             }
-            var nextExam = data.Exams.Where(x => x.EndAt > Now).OrderBy(x => x.StartAt).FirstOrDefault();
+            var nextExam = data.Exams.Where(x => ExamSchedule.IsStillRelevant(x, Now))
+                .OrderBy(x => x.StartAt).FirstOrDefault();
             _store.Update(s =>
             {
                 if (data.Binding is {} binding && ((binding.ClassId.Length > 0 && s.BoundClassId != binding.ClassId) || s.BoundClassTag != binding.ClassTag)) s.SkippedSessionKey = "";
                 s.BoundClassTag = data.Binding?.ClassTag ?? s.BoundClassTag;
                 s.BoundGradeId = data.Binding?.GradeId ?? s.BoundGradeId;
                 s.BoundClassId = data.Binding?.ClassId ?? s.BoundClassId;
+                if (settings.ServiceMode == "online" && data.TimeZoneId.Length > 0) s.OnlineTimeZoneId = data.TimeZoneId;
                 s.LastSyncAt = DateTimeOffset.Now;
                 s.ViewerOnline = data.ViewerOnline;
                 if (data.ViewerOnline) s.LastViewerConfirmedAt = DateTimeOffset.Now;
@@ -270,7 +343,7 @@ public sealed class ExamSyncService : BackgroundService
             try { _store.Write("Exams.cache.json", new ExamCache(Scope(_store.Settings), _validatedAt, data)); }
             catch (Exception ex) { RuntimeError = $"考试缓存未保存：{ex.Message}"; }
             EvaluateProtection(data);
-            Schedule(_store.Settings.SyncSeconds);
+            Schedule(!string.IsNullOrWhiteSpace(_store.Settings.PendingPairToken) ? 5 : _store.Settings.SyncSeconds, !settings.ServiceMode.Equals("online", StringComparison.Ordinal));
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) { if (generation == Interlocked.Read(ref _generation)) Failure($"同步失败：{ex.Message}"); }
@@ -303,6 +376,17 @@ public sealed class ExamSyncService : BackgroundService
 
     private void Status(string text) => _store.Update(s => s.LastStatus = text);
 
+    private void ForgetSnapshot()
+    {
+        _snapshot = null;
+        CurrentSession = NextSession = null;
+        ViewerStatusKnown = false;
+        UsingCache = false;
+        _suppression.SetActive(false);
+        _store.Delete("Exams.cache.json");
+        _store.Update(s => { s.NextExamName = ""; s.NextExamStartAt = null; });
+    }
+
     private void EvaluateSchedule()
     {
         var s = _store.Settings;
@@ -318,7 +402,7 @@ public sealed class ExamSyncService : BackgroundService
         }
         var now = Now;
         var dataWarning = OfflineWarning;
-        var sessions = ExamSchedule.Sessions(snapshot!.Exams, s);
+        var sessions = ExamSchedule.Sessions(snapshot!.Exams, s, now);
         CurrentSession = sessions.FirstOrDefault(x => x.Start <= now && x.End > now);
         NextSession = sessions.FirstOrDefault(x => x.End > now);
         var active = s.EnableExamMode && CurrentSession is {} session && session.Key != s.SkippedSessionKey;
@@ -327,7 +411,8 @@ public sealed class ExamSyncService : BackgroundService
             active ? "考试模式进行中" : "本时段已暂不启用";
 
         var scope = Scope(s);
-        if (s.EnableDayBeforeReminder && TimeSpan.TryParse(s.DayBeforeReminderTime, out var dayBeforeAt))
+        if (ExamSchedule.IsReminderTypeEnabled(s, ReminderType.DayBefore) &&
+            TimeSpan.TryParse(s.DayBeforeReminderTime, out var dayBeforeAt))
         {
             var localNow = TimeZoneInfo.ConvertTime(now, ExamSchedule.TimeZone(s));
             if (localNow.TimeOfDay >= dayBeforeAt)
@@ -344,27 +429,43 @@ public sealed class ExamSyncService : BackgroundService
         foreach (var exam in snapshot.Exams)
         {
             var otherExamActive = ExamSchedule.IsOtherExamInProgress(snapshot.Exams, exam, now, ConsecutiveReminderGuard);
-            foreach (var minutes in s.ReminderMinutes!.Concat(s.EnableStartReminder ? new[] { 0 } : Array.Empty<int>()))
+            if (ExamSchedule.IsReminderTypeEnabled(s, ReminderType.Upcoming))
             {
-                // 连考时不要用下一场的考前提醒打断当前考试；开考提醒不受影响。
-                if (minutes > 0 && otherExamActive) continue;
-                var key = scope + "|" + ExamSchedule.ActionKey(exam, minutes == 0 ? "start" : $"reminder-{minutes}");
-                if (ExamSchedule.IsDue(exam, minutes, now, s.ReminderGraceSeconds) && !_store.HasCompletedAction(key))
+                foreach (var minutes in s.ReminderMinutes!)
                 {
-                    _provider.ShowExamReminder(exam, TimeSpan.FromMinutes(minutes), ExamReminderKind.BeforeStart, dataWarning);
+                    // 连考时不要用下一场的考前提醒打断当前考试。
+                    if (otherExamActive) continue;
+                    var key = scope + "|" + ExamSchedule.ActionKey(exam, $"reminder-{minutes}");
+                    if (ExamSchedule.IsDue(exam, minutes, now, s.ReminderGraceSeconds) && !_store.HasCompletedAction(key))
+                    {
+                        _provider.ShowExamReminder(exam, TimeSpan.FromMinutes(minutes), ExamReminderKind.BeforeStart, dataWarning);
+                        _store.MarkCompletedAction(key);
+                    }
+                }
+            }
+            if (ExamSchedule.IsReminderTypeEnabled(s, ReminderType.Start))
+            {
+                var key = scope + "|" + ExamSchedule.ActionKey(exam, "start");
+                if (ExamSchedule.IsDue(exam, 0, now, s.ReminderGraceSeconds) && !_store.HasCompletedAction(key))
+                {
+                    _provider.ShowExamReminder(exam, TimeSpan.Zero, ExamReminderKind.BeforeStart, dataWarning);
                     _store.MarkCompletedAction(key);
                 }
             }
-            foreach (var minutes in s.EndReminderMinutes ?? [])
+            if (ExamSchedule.IsReminderTypeEnabled(s, ReminderType.BeforeEnd))
             {
-                var key = scope + "|" + ExamSchedule.EndActionKey(exam, $"end-{minutes}");
-                if (ExamSchedule.IsEndDue(exam, minutes, now, s.ReminderGraceSeconds) && !_store.HasCompletedAction(key))
+                foreach (var minutes in s.EndReminderMinutes ?? [])
                 {
-                    _provider.ShowExamReminder(exam, exam.EndAt - now, ExamReminderKind.BeforeEnd, dataWarning);
-                    _store.MarkCompletedAction(key);
+                    var key = scope + "|" + ExamSchedule.EndActionKey(exam, $"end-{minutes}");
+                    if (ExamSchedule.IsEndDue(exam, minutes, now, s.ReminderGraceSeconds) && !_store.HasCompletedAction(key))
+                    {
+                        _provider.ShowExamReminder(exam, exam.PausedAt is {} pausedAt ? exam.EndAt - pausedAt : exam.EndAt - now,
+                            ExamReminderKind.BeforeEnd, dataWarning);
+                        _store.MarkCompletedAction(key);
+                    }
                 }
             }
-            if (s.EnableExamEndReminder)
+            if (ExamSchedule.IsReminderTypeEnabled(s, ReminderType.Ended))
             {
                 var key = scope + "|" + ExamSchedule.EndActionKey(exam, "ended");
                 var startsSoon = ExamSchedule.IsAnotherExamStartingSoon(snapshot.Exams, exam, now, ConsecutiveReminderGuard);
@@ -375,7 +476,8 @@ public sealed class ExamSyncService : BackgroundService
                     _store.MarkCompletedAction(key);
                 }
             }
-            if (!s.AutoOpenBoard || now >= exam.StartAt || exam.StartAt - now > TimeSpan.FromMinutes(s.BrowserLeadMinutes)) continue;
+            if (s.ServiceMode == "online" || !s.AutoOpenBoard || now >= exam.StartAt ||
+                exam.StartAt - now > TimeSpan.FromMinutes(s.BrowserLeadMinutes)) continue;
             var openKey = scope + "|" + ExamSchedule.ActionKey(exam, "open");
             if (!_store.HasCompletedAction(openKey))
             {
@@ -397,9 +499,10 @@ public sealed class ExamSyncService : BackgroundService
     private void EvaluateProtection(ExamBoardBootstrapResponse data)
     {
         var s = _store.Settings;
+        if (s.ServiceMode == "online") { _offlineChecks = _reopens = 0; return; }
         if (data.ViewerOnline) { _offlineChecks = _reopens = 0; return; }
         var near = data.Exams.Any(x => x.StartAt > Now && x.StartAt - Now <= PreStartCheckWindow);
-        var active = data.Exams.Any(x => x.StartAt <= Now && x.EndAt > Now);
+        var active = data.Exams.Any(x => x.StartAt <= Now && (x.EndAt > Now || x.IsPaused));
         if (!s.AutoOpenBoard || (!near && !(active && s.EnableExamGuard))) { _offlineChecks = 0; return; }
         _offlineChecks++;
         if ((near || _offlineChecks >= s.OfflineChecksBeforeReopen) && Now >= _nextOpen) TryOpenBoard("看板离线，尝试恢复");
@@ -413,10 +516,17 @@ public sealed class ExamSyncService : BackgroundService
         _nextOpen = Now.AddSeconds(delay);
         _reopens++;
         _offlineChecks = 0;
-        if (_launcher.TryOpen(ExamBoardUrls.Board(s.BaseUrl, s.PluginInstanceId), out var error)) { Status(reason + "，已发起打开"); return true; }
+        var target = s.ServiceMode == "online" ? ExamBoardUrls.OnlineHome(s.BaseUrl) : ExamBoardUrls.Board(s.BaseUrl, s.PluginInstanceId);
+        if (_launcher.TryOpen(target, out var error)) { Status(reason + "，已发起打开"); return true; }
         Status("无法打开考试看板：" + error);
         return false;
     }
 
-    private static string Scope(PluginSettings s) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{s.BaseUrl}|{s.PluginInstanceId}|{s.ClientSecret}|{s.BoundGradeId}|{(s.BoundClassId.Length > 0 ? s.BoundClassId : s.BoundClassTag)}")));
+    private static string Scope(PluginSettings s)
+    {
+        var value = s.ServiceMode == "online"
+            ? $"online|{s.BaseUrl}|{s.PluginInstanceId}|{s.ClientSecret}|{s.BoundDeviceId}"
+            : $"{s.BaseUrl}|{s.PluginInstanceId}|{s.ClientSecret}|{s.BoundGradeId}|{(s.BoundClassId.Length > 0 ? s.BoundClassId : s.BoundClassTag)}";
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
+    }
 }

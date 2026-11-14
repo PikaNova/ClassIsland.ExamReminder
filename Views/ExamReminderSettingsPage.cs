@@ -58,6 +58,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
     private readonly ReminderSuppressionService _suppression;
     private readonly AnnouncementService _announcements;
     private readonly List<Action> _loaders = [];
+    private readonly ComboBox _serviceMode = new() { Width = 160, ItemsSource = new[] { "学校版", "在线版" } };
     private readonly TextBox _url = new() { Watermark = "http://192.168.1.20:3000 或 https://exam.example.com" };
     private readonly TextBlock _connection = Text("", 14);
     private readonly TextBlock _nextTitle = Text("暂无考试", 26, true);
@@ -77,6 +78,8 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
     private readonly TextBlock _lastSuccessValue = Text("—", 14);
     private readonly TextBlock _nextCheckValue = Text("—", 14);
     private readonly TextBlock _classValue = Text("未绑定", 14);
+    private readonly TextBlock _bindingMetricTitle = Text("班级", 12);
+    private readonly TextBlock _viewerMetricTitle = Text("看板", 12);
     private readonly StatusChip _connectionChip = new("未连接", ChipTone.Neutral);
     private readonly StatusChip _viewerChip = new("未知", ChipTone.Neutral);
     private readonly StatusChip _dataChip = new("等待数据", ChipTone.Neutral);
@@ -102,7 +105,9 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly HashSet<string> _expandedAnnouncements = [];
     private Border? _connectionCard;
+    private Border? _schoolBoardAutomationCard;
     private Button? _disconnect;
+    private Button? _openBoardButton;
     private bool _disconnectArmed;
     private DateTimeOffset _disconnectExpiresAt = DateTimeOffset.MinValue;
     private bool _refreshing;
@@ -124,6 +129,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
         _speechChip.Margin = new Thickness(0, 0, 8, 0);
         _speechStatus.VerticalAlignment = VerticalAlignment.Center;
         _connect.Click += async (_, _) => await ConnectAsync();
+        _serviceMode.SelectionChanged += (_, _) => ChangeServiceMode();
         _skip.Click += (_, _) => _sync.SkipCurrentSession();
         _markAllRead.Click += (_, _) =>
         {
@@ -197,6 +203,14 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
         LayoutOverview(1120);
         overview.SizeChanged += (_, e) => LayoutOverview(e.NewSize.Width);
         var options = new StackPanel { Spacing = 16 };
+        options.Children.Add(Card("提醒类型", new StackPanel
+        {
+            Spacing = 12, Children =
+            {
+                Text("提醒类型在 ClassIsland 的“提醒 → 考试提醒 → 基本设置”中管理。可分别启用即将开始、考试开始、结束前、考试结束、考试时间变更和次日预告。", 13),
+                Text("本页下方只配置已启用类型的时间节点、文案和显示方式；自动考试模式始终按绑定班级的完整适用日程运行。", 12)
+            }
+        }));
         options.Children.Add(Card("考试语音", new StackPanel
         {
             Spacing = 12, Children =
@@ -213,7 +227,6 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             {
                 TextSetting("考前提醒节点", "填写提前分钟数，用逗号分隔；留空关闭考前提醒。最多 20 个，范围 1–1440。上一场未结束时不会打断播报下一场的考前提醒。",
                     s => JoinMinutes(s.ReminderMinutes), (s,v) => s.ReminderMinutes = ParseMinutes(v)),
-                Switch("开考时提醒", "考试开始时显示并按语音开关播报。", s => s.EnableStartReminder, (s,v) => s.EnableStartReminder = v),
                 TextSetting("考前文案", "可用占位符：{考试}、{分钟}、{班级}、{时间}、{结束时间}。", s => s.ReminderTemplate, (s,v) => s.ReminderTemplate = v),
                 TextSetting("开考文案", "显示文字与语音使用同一文案。", s => s.StartTemplate, (s,v) => s.StartTemplate = v)
             }
@@ -224,7 +237,6 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             {
                 TextSetting("结束前提醒节点", "填写结束前分钟数，用逗号分隔；留空关闭结束前提醒。最多 20 个，范围 1–1440。",
                     s => JoinMinutes(s.EndReminderMinutes), (s,v) => s.EndReminderMinutes = ParseMinutes(v)),
-                Switch("考试结束时提醒", "考试结束后显示一次提醒，按语音开关播报。", s => s.EnableExamEndReminder, (s,v) => s.EnableExamEndReminder = v),
                 TextSetting("结束前文案", "可用占位符：{考试}、{分钟}、{班级}、{时间}、{结束时间}。", s => s.EndTemplate, (s,v) => s.EndTemplate = v),
                 TextSetting("结束文案", "考试结束时显示的文字；可用 {考试}、{班级}、{时间}、{结束时间}。", s => s.ExamEndTemplate, (s,v) => s.ExamEndTemplate = v)
             }
@@ -233,9 +245,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
         {
             Spacing = 12, Children =
             {
-                Switch("考试安排变更提醒", "考试被取消，或名称、开考、结束时间变化时提醒一次；首次同步、换班和缓存恢复不提醒。", s => s.EnableExamChangeReminder, (s,v) => s.EnableExamChangeReminder = v),
                 TextSetting("变更文案", "可用占位符：{变更}、{数量}、{班级}。超过 3 处变更时自动汇总。", s => s.ExamChangeTemplate, (s,v) => s.ExamChangeTemplate = v),
-                Switch("次日考试预告", "每天指定时间播报一次明天的考试；明天没有考试时保持安静。", s => s.EnableDayBeforeReminder, (s,v) => s.EnableDayBeforeReminder = v),
                 TextSetting("次日预告时间", "学校当地时间，24 小时制，例如 17:30。", s => s.DayBeforeReminderTime, (s,v) =>
                 {
                     if (!TimeSpan.TryParse(v.Trim(), out var time) || time < TimeSpan.Zero || time >= TimeSpan.FromHours(24))
@@ -261,7 +271,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
                 Number("提前进入", "分钟，首场考试前开始。", s => s.ExamModeLeadMinutes, (s,v) => s.ExamModeLeadMinutes = v, 0, 240, s => s.EnableExamMode),
                 Number("延后退出", "分钟，最后一场结束后继续保持。", s => s.ExamModeTailMinutes, (s,v) => s.ExamModeTailMinutes = v, 0, 240, s => s.EnableExamMode),
                 Number("上午／下午分界", "学校当地时间的小时；默认 13:00，跨中午考试全程覆盖。", s => s.SessionBoundaryHour, (s,v) => s.SessionBoundaryHour = v, 1, 23, s => s.EnableExamMode),
-                TextSetting("学校时区", "默认 Asia/Shanghai，也支持系统可识别的其他时区。", s => s.SchoolTimeZone, (s,v) =>
+                TextSetting("考试时区", "在线版使用已发布考试提供的时区；学校版可在此设置，默认 Asia/Shanghai。", s => s.SchoolTimeZone, (s,v) =>
                 {
                     TimeZoneInfo.FindSystemTimeZoneById(v.Trim()); s.SchoolTimeZone = v.Trim();
                 })
@@ -281,7 +291,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
                     SecondaryButton("刷新可选提醒来源", BuildSources))
             }
         }));
-        options.Children.Add(Card("看板自动打开与守护", new StackPanel
+        _schoolBoardAutomationCard = Card("看板自动打开与守护", new StackPanel
         {
             Spacing = 12, Children =
             {
@@ -292,7 +302,8 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
                 Number("重开最短间隔", "秒，连续失败会逐步延长间隔。", s => s.BrowserCooldownSeconds, (s,v) => s.BrowserCooldownSeconds = v, 30, 3600, s => s.AutoOpenBoard),
                 Number("重开退避上限", "分钟；不低于上面的最短间隔。", s => s.MaxBrowserCooldownMinutes, (s,v) => s.MaxBrowserCooldownMinutes = v, 1, 120, s => s.AutoOpenBoard)
             }
-        }));
+        });
+        options.Children.Add(_schoolBoardAutomationCard);
         var network = new StackPanel
         {
             Spacing = 16, Children =
@@ -441,8 +452,14 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             ColumnSpacing = 16
         };
         AddMetric(grid, 0, 0, "连接", _connectionChip);
-        AddMetric(grid, 0, 1, "班级", _classValue);
-        AddMetric(grid, 1, 0, "看板", _viewerChip);
+        var bindingMetric = new StackPanel { Spacing = 4, Margin = new Thickness(0, 0, 0, 0) };
+        bindingMetric.Children.Add(_bindingMetricTitle);
+        bindingMetric.Children.Add(_classValue);
+        Grid.SetRow(bindingMetric, 0); Grid.SetColumn(bindingMetric, 1); grid.Children.Add(bindingMetric);
+        var viewerMetric = new StackPanel { Spacing = 4, Margin = new Thickness(0, 12, 0, 0) };
+        viewerMetric.Children.Add(_viewerMetricTitle);
+        viewerMetric.Children.Add(_viewerChip);
+        Grid.SetRow(viewerMetric, 1); Grid.SetColumn(viewerMetric, 0); grid.Children.Add(viewerMetric);
         AddMetric(grid, 1, 1, "数据", _dataChip);
         AddMetric(grid, 2, 0, "下次检查", _nextCheckValue);
         AddMetric(grid, 2, 1, "最近成功", _lastSuccessValue);
@@ -477,10 +494,11 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
     private Control BuildSyncActions()
     {
         _disconnect = DangerTextButton("断开本机连接", RequestDisconnect);
+        _openBoardButton = SecondaryButton("打开看板", OpenBoard);
         return Buttons(
             PrimaryButton("立即同步", () => _sync.RequestImmediateSync()),
             SecondaryButton("完整校验", () => _sync.RequestImmediateSync(true)),
-            SecondaryButton("打开看板", OpenBoard),
+            _openBoardButton,
             SecondaryButton("测试考试提醒", () =>
             {
                 if (_sync.TryShowCurrentOrNextExamReminder(out var error)) SetFeedback("已显示测试提醒");
@@ -489,15 +507,37 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             _disconnect);
     }
 
-    private Border BuildConnectionCard() => Card("考试看板连接", new StackPanel
+    private Border BuildConnectionCard() => Card("服务连接", new StackPanel
     {
         Spacing = 12, Children =
         {
-            _connection, _url,
-            Text("支持内网 HTTP、域名及端口，接口和考试大屏路径自动补全。HTTP 连接未加密。", 12),
+            _connection, SettingRow("服务类型", "学校版连接学校看板；在线版连接 Novora 在线服务。", _serviceMode), _url,
+            Text("学校版支持内网 HTTP；在线版必须使用 HTTPS。填写服务根地址，接口与网页路径由插件补全。在线版不使用学校看板自动打开与守护设置。", 12),
             Buttons(_connect)
         }
     });
+
+    private void ChangeServiceMode()
+    {
+        if (_refreshing) return;
+        var next = _serviceMode.SelectedIndex == 1 ? "online" : "school";
+        if (_store.Settings.ServiceMode == next) return;
+        _store.Update(s =>
+        {
+            s.ServiceMode = next;
+            s.IsPaired = false;
+            s.PendingPairToken = "";
+            s.PairExpiresAt = null;
+            s.BoundDeviceId = "";
+            s.BoundClassTag = "";
+            s.BoundGradeId = s.BoundClassId = "";
+            s.OnlineTimeZoneId = "";
+            s.LastStatus = next == "online" ? "在线版尚未连接" : "学校版尚未连接";
+        });
+        _sync.ResetConnection();
+        _announcements.Refresh();
+        SetFeedback(next == "online" ? "已切换到在线版；请填写 HTTPS 服务地址并发起网页配对。" : "已切换到学校版；请填写学校看板地址并发起配对。");
+    }
 
     private void RequestDisconnect()
     {
@@ -523,43 +563,83 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
 
     private void Disconnect()
     {
-        _store.Update(s => { s.IsPaired = false; s.PendingPairToken = ""; s.PairExpiresAt = null; s.BoundClassTag = ""; s.LastStatus = "已断开，请重新连接"; });
+        _store.Update(s => { s.IsPaired = false; s.PendingPairToken = ""; s.PairExpiresAt = null; s.BoundDeviceId = ""; s.BoundClassTag = ""; s.BoundGradeId = s.BoundClassId = ""; s.OnlineTimeZoneId = ""; s.LastStatus = "已断开，请重新连接"; });
         _sync.ResetConnection();
     }
 
     private async Task ConnectAsync()
     {
         if (!ExamBoardUrls.TryNormalizeBaseUrl(_url.Text ?? "", out var url, out var error)) { SetFeedback(error, true); return; }
+        var current = _store.Settings;
+        var online = current.ServiceMode == "online";
+        if (online && (!Uri.TryCreate(url, UriKind.Absolute, out var onlineUri) || onlineUri.Scheme != Uri.UriSchemeHttps))
+        { SetFeedback("在线版连接必须使用 HTTPS。", true); return; }
         _connect.IsEnabled = false;
+        _serviceMode.IsEnabled = false;
+        _url.IsEnabled = false;
         SetFeedback("正在创建配对，请稍候…");
         try
         {
             var token = PluginSettings.CreateSecret();
-            _store.Update(s => { s.BaseUrl = url; s.IsPaired = false; s.BoundClassTag = ""; s.BoundGradeId = s.BoundClassId = ""; s.PendingPairToken = token; s.PairExpiresAt = DateTimeOffset.Now.AddMinutes(5); s.LastStatus = "正在创建浏览器配对"; s.ServerOffsetMilliseconds = 0; });
-            _sync.ResetConnection();
-            var s = _store.Settings;
-            var result = await _client.StartPairingAsync(url, s.PluginInstanceId, s.ClientSecret, token);
+            var keepExistingOnlineBinding = online && current.IsPaired && string.Equals(current.BaseUrl, url, StringComparison.OrdinalIgnoreCase);
+            var result = await _client.StartPairingAsync(url, current.PluginInstanceId, current.ClientSecret, token, online: online);
             if (!result.IsSuccess || result.Value is null)
             {
-                _store.Update(v => { v.PendingPairToken = ""; v.PairExpiresAt = null; v.LastStatus = result.Error ?? "配对失败"; });
                 SetFeedback(result.Error ?? "配对失败", true); return;
             }
-            if (_launcher.TryOpen(result.Value, out var launchError))
+            _store.Update(s =>
             {
-                SetFeedback("请在浏览器中确认班级绑定。");
+                s.BaseUrl = url;
+                if (!keepExistingOnlineBinding)
+                {
+                    s.IsPaired = false;
+                    s.BoundDeviceId = "";
+                    s.BoundClassTag = "";
+                    s.BoundGradeId = s.BoundClassId = "";
+                    s.OnlineTimeZoneId = "";
+                }
+                s.PendingPairToken = token;
+                s.PairExpiresAt = result.Value.ExpiresAt is {} expiresAt
+                    ? DateTimeOffset.FromUnixTimeMilliseconds(expiresAt)
+                    : DateTimeOffset.UtcNow.AddMinutes(5);
+                s.LastStatus = keepExistingOnlineBinding ? "正在创建新配对，当前考试保持连接" : "正在创建浏览器配对";
+                s.ServerOffsetMilliseconds = 0;
+            });
+            if (keepExistingOnlineBinding) _sync.RequestImmediateSync();
+            else _sync.ResetConnection();
+            if (_launcher.TryOpen(result.Value.PairUrl, out var launchError))
+            {
+                SetFeedback(online ? "请在浏览器登录并选择已发布的考试；当前授权会在确认成功后切换。" : "请在浏览器中确认班级绑定。");
                 _sync.RequestImmediateSync();
             }
-            else SetFeedback("浏览器启动失败：" + launchError, true);
+            else
+            {
+                _store.Update(s =>
+                {
+                    if (s.PendingPairToken != token) return;
+                    s.PendingPairToken = "";
+                    s.PairExpiresAt = null;
+                    s.LastStatus = "浏览器启动失败";
+                });
+                _sync.RequestImmediateSync();
+                SetFeedback("浏览器启动失败：" + launchError, true);
+            }
             _announcements.Refresh();
         }
         catch (Exception ex) { SetFeedback("连接失败：" + ex.Message, true); }
-        finally { _connect.IsEnabled = true; }
+        finally
+        {
+            _connect.IsEnabled = true;
+            _serviceMode.IsEnabled = true;
+            _url.IsEnabled = true;
+        }
     }
 
     private void OpenBoard()
     {
         if (!ExamBoardUrls.TryNormalizeBaseUrl(_store.Settings.BaseUrl, out var url, out var error)) { SetFeedback(error, true); return; }
-        if (!_launcher.TryOpen(ExamBoardUrls.Board(url, _store.Settings.PluginInstanceId), out error)) SetFeedback(error, true);
+        var target = _store.Settings.ServiceMode == "online" ? ExamBoardUrls.OnlineHome(url) : ExamBoardUrls.Board(url, _store.Settings.PluginInstanceId);
+        if (!_launcher.TryOpen(target, out error)) SetFeedback(error, true);
     }
 
     private void OnChanged(object? sender, EventArgs e) => Dispatcher.UIThread.Post(() =>
@@ -574,6 +654,9 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
         try
         {
             if (!_url.IsFocused) _url.Text = _store.Settings.BaseUrl;
+            _serviceMode.SelectedIndex = _store.Settings.ServiceMode == "online" ? 1 : 0;
+            _url.Watermark = _store.Settings.ServiceMode == "online" ? "https://online.example.com" : "http://192.168.1.20:3000 或 https://exam.example.com";
+            _connect.Content = _store.Settings.ServiceMode == "online" ? "连接并在网页选择考试" : "连接并在浏览器绑定";
             foreach (var loader in _loaders) loader();
         }
         finally { _refreshing = false; }
@@ -583,10 +666,14 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
     {
         var s = _store.Settings;
         var now = _sync.Now;
-        _connection.Text = s.IsPaired ? $"已连接 · {s.BoundClassTag}" : !string.IsNullOrEmpty(s.PendingPairToken)
-            ? $"等待浏览器绑定 · 有效至 {s.PairExpiresAt:HH:mm:ss}" : "尚未连接考试看板";
+        _connection.Text = s.IsPaired
+            ? $"已连接 · {s.BoundClassTag}" + (!string.IsNullOrEmpty(s.PendingPairToken) && s.ServiceMode == "online" ? " · 等待新配对确认" : "")
+            : !string.IsNullOrEmpty(s.PendingPairToken)
+                ? $"等待浏览器绑定 · 有效至 {s.PairExpiresAt:HH:mm:ss}"
+                : s.ServiceMode == "online" ? "尚未连接在线服务" : "尚未连接考试看板";
 
-        var exam = _sync.Exams.Where(x => x.EndAt > now).OrderBy(x => x.StartAt).FirstOrDefault();
+        var exam = _sync.Exams.Where(x => ExamSchedule.IsStillRelevant(x, now))
+            .OrderBy(x => x.StartAt).FirstOrDefault();
         var phase = exam is null ? "" : ExamSchedule.Phase(exam, now);
         _nextTitle.Text = exam?.Name ?? "暂无考试";
         if (exam is null)
@@ -596,21 +683,26 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             _heroPhase.Text = "暂无";
             _heroPhase.SetTone(ChipTone.Neutral);
             _heroTime.IsVisible = false;
-            _heroClass.Text = string.IsNullOrWhiteSpace(s.BoundClassTag) ? "未绑定班级" : s.BoundClassTag;
+            _heroClass.Text = s.ServiceMode == "online"
+                ? string.IsNullOrWhiteSpace(s.BoundClassTag) ? "未连接考试" : s.BoundClassTag
+                : string.IsNullOrWhiteSpace(s.BoundClassTag) ? "未绑定班级" : s.BoundClassTag;
             _nextDetail.Text = "同步成功后将在此显示当前或下一场考试。";
         }
         else
         {
             var ending = exam.StartAt <= now;
-            _heroCountdown.Text = FormatCountdown(ending ? exam.EndAt - now : exam.StartAt - now);
-            _heroLabel.Text = ending ? "距离结束" : "距离开考";
+            var remaining = exam.PausedAt is {} pausedAt ? exam.EndAt - pausedAt : exam.EndAt - now;
+            _heroCountdown.Text = exam.IsPaused && exam.PausedAt is null ? "已暂停" : FormatCountdown(ending ? remaining : exam.StartAt - now);
+            _heroLabel.Text = exam.IsPaused ? "倒计时已暂停" : ending ? "距离结束" : "距离开考";
             _heroPhase.Text = phase;
             _heroPhase.SetTone(phase == "进行中" ? ChipTone.Success : phase == "待开始" ? ChipTone.Accent : ChipTone.Neutral);
             var start = Local(exam.StartAt);
             var end = Local(exam.EndAt);
             _heroTime.Text = start.Date == end.Date ? $"{start:MM-dd HH:mm}–{end:HH:mm}" : $"{start:MM-dd HH:mm}–{end:MM-dd HH:mm}";
             _heroTime.IsVisible = true;
-            _heroClass.Text = string.IsNullOrWhiteSpace(s.BoundClassTag) ? "未绑定班级" : s.BoundClassTag;
+            _heroClass.Text = s.ServiceMode == "online"
+                ? string.IsNullOrWhiteSpace(s.BoundClassTag) ? "未连接考试" : s.BoundClassTag
+                : string.IsNullOrWhiteSpace(s.BoundClassTag) ? "未绑定班级" : s.BoundClassTag;
             _nextDetail.Text = $"{start:yyyy-MM-dd} · {phase}";
         }
 
@@ -638,17 +730,21 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
         _skip.Content = skippedCurrent ? "本时段已跳过" : "本时段暂不启用";
 
         var pending = !string.IsNullOrEmpty(s.PendingPairToken);
+        if (_schoolBoardAutomationCard is not null) _schoolBoardAutomationCard.IsVisible = s.ServiceMode != "online";
+        _bindingMetricTitle.Text = s.ServiceMode == "online" ? "考试" : "班级";
+        _viewerMetricTitle.Text = s.ServiceMode == "online" ? "服务" : "看板";
+        if (_openBoardButton is not null) _openBoardButton.Content = s.ServiceMode == "online" ? "打开在线管理台" : "打开看板";
         _connectionChip.Text = s.IsPaired ? "已连接" : pending ? "待绑定" : "未连接";
         _connectionChip.SetTone(s.IsPaired ? ChipTone.Success : pending ? ChipTone.Caution : ChipTone.Neutral);
-        _classValue.Text = s.IsPaired ? s.BoundClassTag : "未绑定";
-        _viewerChip.Text = !_sync.ViewerStatusKnown ? "未知" : s.ViewerOnline ? "在线" : "离线";
-        _viewerChip.SetTone(!_sync.ViewerStatusKnown ? ChipTone.Neutral : s.ViewerOnline ? ChipTone.Success : ChipTone.Critical);
+        _classValue.Text = s.IsPaired ? s.BoundClassTag : s.ServiceMode == "online" ? "未连接" : "未绑定";
+        _viewerChip.Text = s.ServiceMode == "online" ? (_sync.ViewerStatusKnown ? "在线服务" : "服务未知") : !_sync.ViewerStatusKnown ? "未知" : s.ViewerOnline ? "在线" : "离线";
+        _viewerChip.SetTone(!_sync.ViewerStatusKnown ? ChipTone.Neutral : s.ServiceMode == "online" || s.ViewerOnline ? ChipTone.Success : ChipTone.Critical);
         _dataChip.Text = _sync.IsOfflineData ? "离线" : _sync.Exams.Count > 0 ? "最新" : "等待数据";
         _dataChip.SetTone(_sync.IsOfflineData ? ChipTone.Caution : _sync.Exams.Count > 0 ? ChipTone.Success : ChipTone.Neutral);
         _lastSuccessValue.Text = s.LastSyncAt is {} success ? $"{Local(success):MM-dd HH:mm:ss}" : "—";
         _nextCheckValue.Text = _sync.NextSyncAt is {} nextAt ? $"{Local(nextAt):HH:mm:ss}" : "已关闭";
         _syncStatus.Text = $"{_sync.SyncMode} · {s.LastStatus}" + (_sync.IsOfflineData ? $" · {_sync.OfflineWarning}" : "");
-        if (_connectionCard is not null) _connectionCard.IsVisible = !s.IsPaired;
+        if (_connectionCard is not null) _connectionCard.IsVisible = !s.IsPaired || s.ServiceMode == "online";
         if (_disconnect is not null)
         {
             _disconnect.IsVisible = s.IsPaired;
@@ -742,11 +838,12 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
 
     private string BuildRuntimeDiagnostics()
     {
+        var online = _store.Settings.ServiceMode == "online";
         var detail = _announcements.LastErrorDetail;
         if (detail.Length > 500) detail = detail[..500] + "…";
         return $"本次运行：成功 {_sync.SuccessfulChecks} 次，失败 {_sync.FailedChecks} 次\n" +
             $"最近请求耗时：{_sync.LastRequestMilliseconds:F0} ms\n" +
-            $"自动打开看板：{_sync.BrowserOpenAttempts} 次\n" +
+            (online ? "学校看板自动打开：在线模式不适用\n" : $"自动打开看板：{_sync.BrowserOpenAttempts} 次\n") +
             $"服务端校时偏差：{_store.Settings.ServerOffsetMilliseconds} ms\n" +
             $"最近尝试：{Time(_sync.LastAttemptAt)}\n" +
             $"数据校验：{Time(_sync.DataValidatedAt)}\n" +
@@ -767,7 +864,7 @@ public sealed class ExamReminderSettingsPage : SettingsPageBase
             $"同步：{_sync.SyncMode} · 成功 {_sync.SuccessfulChecks} / 失败 {_sync.FailedChecks}",
             $"最近成功：{Time(s.LastSyncAt)} · 上次尝试：{Time(_sync.LastAttemptAt)} · 数据校验：{Time(_sync.DataValidatedAt)}",
             $"数据状态：{(_sync.IsOfflineData ? _sync.OfflineWarning : "在线/最新")}",
-            $"看板：{(_sync.ViewerStatusKnown ? (s.ViewerOnline ? "在线" : "离线") : "未知")} · 使用缓存：{(_sync.UsingCache ? "是" : "否")}",
+            $"{(s.ServiceMode == "online" ? "在线授权" : "看板")}：{(s.ServiceMode == "online" ? (s.IsPaired ? "已连接" : "未连接") : _sync.ViewerStatusKnown ? (s.ViewerOnline ? "在线" : "离线") : "未知")} · 使用缓存：{(_sync.UsingCache ? "是" : "否")}",
             $"状态：{s.LastStatus}",
             $"提醒屏蔽：{_suppression.Status} · 已选 {s.SuppressedProviders.Count} 项",
             $"作者公告：{_announcements.Status} · 最近成功 {Time(_announcements.LastCheckedAt)}",

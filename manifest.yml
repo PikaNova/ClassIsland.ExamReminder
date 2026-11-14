@@ -1,7 +1,7 @@
 # nonk8s
 id: classisland.exam-reminder
 name: 考试提醒
-description: 同步学校考试看板，提供考试提醒、安排变更提醒、次日预告与自动考试模式。
+description: 同步学校看板或 Novora 在线考试，提供考试提醒、安排变更和自动考试模式。
 entranceAssembly: "ClassIsland.ExamReminder.dll"
 url: https://github.com/PikaNova/ClassIsland.ExamReminder
 version: 0.3.2.1

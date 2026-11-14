@@ -19,7 +19,7 @@ public class Plugin : PluginBase
         services.AddSingleton<ExamReminderProvider>();
         services.AddSingleton<ReminderSuppressionService>();
         services.AddSettingsPage<ExamReminderSettingsPage>();
-        services.AddNotificationProvider<ExamReminderProvider>();
+        services.AddNotificationProvider<ExamReminderProvider, ExamReminderProviderSettingsControl>();
         services.AddSingleton<ExamSyncService>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<ExamSyncService>());
         services.AddSingleton<AnnouncementService>();

@@ -8,11 +8,14 @@ public sealed class PluginSettings
     public const string AfterSchoolProviderId = "8FBC3A26-6D20-44DD-B895-B9411E3DDC51";
     public static readonly string[] DefaultSuppressedProviderIds = [CourseProviderId, AfterSchoolProviderId];
 
+    public string ServiceMode { get; set; } = "school";
     public string BaseUrl { get; set; } = string.Empty;
     public string PluginInstanceId { get; set; } = $"classisland-{Guid.NewGuid():N}";
     public string ClientSecret { get; set; } = CreateSecret();
     public string PendingPairToken { get; set; } = string.Empty;
     public DateTimeOffset? PairExpiresAt { get; set; }
+    public string BoundDeviceId { get; set; } = string.Empty;
+    public string OnlineTimeZoneId { get; set; } = string.Empty;
     public string BoundClassTag { get; set; } = string.Empty;
     public string BoundGradeId { get; set; } = string.Empty;
     public string BoundClassId { get; set; } = string.Empty;
@@ -22,6 +25,7 @@ public sealed class PluginSettings
     public bool EnableExamGuard { get; set; } = true;
     public bool EnableFifteenMinuteReminder { get; set; } = true;
     public bool EnableFiveMinuteReminder { get; set; } = true;
+    public bool EnableBeforeStartReminder { get; set; } = true;
     public bool EnableStartReminder { get; set; } = true;
     public DateTimeOffset? LastSyncAt { get; set; }
     public bool ViewerOnline { get; set; }
@@ -45,6 +49,7 @@ public sealed class PluginSettings
     public string ReminderTemplate { get; set; } = "距离{考试}开始还有{分钟}分钟，请做好准备。";
     public string StartTemplate { get; set; } = "{考试}现在开始。";
     public List<int>? EndReminderMinutes { get; set; } = [15, 5];
+    public bool EnableBeforeEndReminder { get; set; } = true;
     public bool EnableExamEndReminder { get; set; } = true;
     public string EndTemplate { get; set; } = "距离{考试}结束还有{分钟}分钟，请检查答题卡。";
     public string ExamEndTemplate { get; set; } = "{考试}已结束。";

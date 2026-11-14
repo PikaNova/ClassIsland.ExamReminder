@@ -2,7 +2,7 @@ namespace ClassIsland.ExamReminder.Services;
 
 public static class ExamBoardUrls
 {
-    private static readonly string[] KnownSuffixes = ["/exam", "/admin", "/settings", "/preferences", "/plugin/connect"];
+    private static readonly string[] KnownSuffixes = ["/online/plugin/connect", "/plugin/connect", "/preferences", "/settings", "/admin", "/exam", "/online"];
 
     public static bool TryNormalizeBaseUrl(string value, out string normalized, out string error)
     {
@@ -44,6 +44,10 @@ public static class ExamBoardUrls
     }
 
     public static Uri Api(string baseUrl) => Append(baseUrl, "api/exams");
+
+    public static Uri OnlineApi(string baseUrl) => Append(baseUrl, "api/online");
+
+    public static Uri OnlineHome(string baseUrl) => Append(baseUrl, "online");
 
     public static Uri Pairing(string baseUrl, string pairToken) =>
         WithQuery(Append(baseUrl, "plugin/connect"), $"token={Uri.EscapeDataString(pairToken)}");

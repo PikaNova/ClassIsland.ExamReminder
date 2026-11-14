@@ -59,7 +59,7 @@ public sealed class AnnouncementService(PluginSettingsStore store) : BackgroundS
 
     public Uri Source()
     {
-        var url = string.IsNullOrWhiteSpace(store.Settings.BaseUrl)
+        var url = string.IsNullOrWhiteSpace(store.Settings.BaseUrl) || store.Settings.ServiceMode == "online"
             ? "https://telemetry.pikachu2026.space/api/public-announcements?limit=30"
             : store.Settings.BaseUrl.TrimEnd('/') + "/api/announcements?limit=30";
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") || !string.IsNullOrEmpty(uri.UserInfo))

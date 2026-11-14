@@ -61,6 +61,15 @@ public sealed class PluginSettingsStore
         lock (_gate) WriteAtomic(name, JsonSerializer.Serialize(value, JsonOptions));
     }
 
+    public void Delete(string name)
+    {
+        lock (_gate)
+        {
+            var path = Path.Combine(_folder, name);
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
     private void WriteAtomic(string name, string json)
     {
         Directory.CreateDirectory(_folder);
@@ -72,6 +81,7 @@ public sealed class PluginSettingsStore
 
     public static void Normalize(PluginSettings value)
     {
+        if (value.ServiceMode is not ("school" or "online")) value.ServiceMode = "school";
         if (string.IsNullOrWhiteSpace(value.PluginInstanceId)) value.PluginInstanceId = $"classisland-{Guid.NewGuid():N}";
         if (string.IsNullOrWhiteSpace(value.ClientSecret) || value.ClientSecret.Length < 32) value.ClientSecret = PluginSettings.CreateSecret();
         value.BrowserLeadMinutes = Math.Clamp(value.BrowserLeadMinutes, 1, 240);
@@ -80,7 +90,8 @@ public sealed class PluginSettingsStore
         value.RequestTimeoutSeconds = Math.Clamp(value.RequestTimeoutSeconds, 3, 60);
         value.MaxRetryMinutes = Math.Clamp(value.MaxRetryMinutes, 1, 120);
         value.CacheMaxHours = Math.Clamp(value.CacheMaxHours, 1, 168);
-        value.ReminderMinutes ??= new[] { value.EnableFifteenMinuteReminder ? 15 : 0, value.EnableFiveMinuteReminder ? 5 : 0 }.Where(x => x > 0).ToList();
+        value.ReminderMinutes ??= new[] { value.EnableFifteenMinuteReminder ? 15 : 0, value.EnableFiveMinuteReminder ? 5 : 0 }
+            .Where(x => x > 0).ToList();
         value.ReminderMinutes = value.ReminderMinutes.Where(x => x is > 0 and <= 1440).Distinct().OrderDescending().Take(20).ToList();
         value.EndReminderMinutes ??= [15, 5];
         value.EndReminderMinutes = value.EndReminderMinutes.Where(x => x is > 0 and <= 1440).Distinct().OrderDescending().Take(20).ToList();
